@@ -435,11 +435,43 @@ def evaluate_and_act():
     log.info("Δ %.1f°F  |  %s=%.1f°F (hot)  %s=%.1f°F (cold)  |  threshold=%.1f°F",
              delta, hot_loc, max_temp, cold_loc, min_temp, TEMP_DELTA_THRESHOLD_F)
 
-    token     = get_access_token()
+    token      = get_access_token()
     thermostat = find_thermostat(token)
     if thermostat is None:
         log.error("No thermostat found via SDM API.")
         return
+
+    # ── Inject thermostat temperature into the sensor store ──
+    traits   = thermostat.get("traits", {})
+    temp_c   = traits.get("sdm.devices.traits.Temperature", {}).get("ambientTemperatureCelsius")
+    humidity = traits.get("sdm.devices.traits.Humidity",    {}).get("ambientHumidityPercent")
+    room     = (thermostat.get("parentRelations") or [{}])[0].get("displayName", "thermostat")
+    location = f"nest: {room.lower()}"
+
+    if temp_c is not None:
+        temp_f = round(temp_c * 9 / 5 + 32, 1)
+        ts = time.time()
+        with sensor_lock:
+            sensor_data[location] = {
+                "temp_f":      temp_f,
+                "temp_c":      round(temp_c, 1),
+                "humidity":    humidity,
+                "received_at": ts,
+            }
+            if location not in sensor_history:
+                sensor_history[location] = deque(maxlen=HISTORY_MAX)
+            sensor_history[location].append({
+                "ts":       ts * 1000,
+                "temp_f":   temp_f,
+                "humidity": humidity,
+            })
+        log.info("❶ Nest         %-15s  %.1f°F  %s%% RH  fan=%s",
+                 location, temp_f, humidity or "?", fan_mode(thermostat))
+        socketio.emit("sensor_update", _dashboard_payload())
+        socketio.emit("history_point", {
+            "location": location,
+            "point":    {"ts": ts * 1000, "temp_f": temp_f, "humidity": humidity},
+        })
 
     current_mode = fan_mode(thermostat)
     device_name  = thermostat["name"]
