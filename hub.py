@@ -148,7 +148,8 @@ def status():
     .delta { margin-top: 16px; padding: 12px 16px; background: #fff; border-radius: 8px; box-shadow: 0 1px 4px rgba(0,0,0,.1); font-size: .95rem; }
     .delta span { font-weight: 600; }
     #updated { color: #aaa; font-size: .78rem; margin-top: 12px; }
-    .chart-wrap { background: #fff; border-radius: 8px; padding: 16px; box-shadow: 0 1px 4px rgba(0,0,0,.1); }
+    .chart-wrap { background: #fff; border-radius: 8px; padding: 16px; box-shadow: 0 1px 4px rgba(0,0,0,.1); margin-bottom: 16px; }
+    .chart-label { font-size: .8rem; font-weight: 600; color: #666; text-transform: uppercase; letter-spacing: .05em; margin: 0 0 6px 4px; }
   </style>
 </head>
 <body>
@@ -169,7 +170,10 @@ def status():
   </div>
 
   <div id="view-graph" class="view">
-    <div class="chart-wrap"><canvas id="chart"></canvas></div>
+    <p class="chart-label">Temperature (°F)</p>
+    <div class="chart-wrap"><canvas id="chart-temp"></canvas></div>
+    <p class="chart-label">Humidity (%)</p>
+    <div class="chart-wrap"><canvas id="chart-humidity"></canvas></div>
   </div>
 
   <div id="updated"></div>
@@ -187,46 +191,59 @@ def status():
       document.querySelectorAll('.view').forEach(v => {
         v.classList.toggle('active', v.id === 'view-' + name);
       });
-      if (name === 'graph') chart.resize();
+      if (name === 'graph') { chartTemp.resize(); chartHumidity.resize(); }
     }
 
-    // ── Chart ─────────────────────────────────────────────────
+    // ── Charts ────────────────────────────────────────────────
     const COLORS = ['#1a73e8','#e53935','#43a047','#fb8c00','#8e24aa','#00acc1'];
     let colorIdx = 0;
-    const datasetsByLocation = {};   // { location: Chart.js dataset }
+    const colorByLocation = {};
 
-    const chart = new Chart(document.getElementById('chart'), {
-      type: 'line',
-      data: { datasets: [] },
-      options: {
-        animation: false,
-        responsive: true,
-        interaction: { mode: 'index', intersect: false },
-        plugins: { legend: { position: 'top' } },
-        scales: {
-          x: { type: 'time', time: { tooltipFormat: 'h:mm:ss a', displayFormats: { minute: 'h:mm a', hour: 'h a' } }, title: { display: true, text: 'Time' } },
-          y: { title: { display: true, text: 'Temperature (°F)' } },
+    function locationColor(loc) {
+      if (!colorByLocation[loc]) colorByLocation[loc] = COLORS[colorIdx++ % COLORS.length];
+      return colorByLocation[loc];
+    }
+
+    function makeChart(canvasId, yLabel) {
+      return new Chart(document.getElementById(canvasId), {
+        type: 'line',
+        data: { datasets: [] },
+        options: {
+          animation: false,
+          responsive: true,
+          interaction: { mode: 'index', intersect: false },
+          plugins: { legend: { position: 'top' } },
+          scales: {
+            x: { type: 'time', time: { tooltipFormat: 'h:mm:ss a', displayFormats: { minute: 'h:mm a', hour: 'h a' } } },
+            y: { title: { display: true, text: yLabel } },
+          },
         },
-      },
-    });
+      });
+    }
 
-    function ensureDataset(location) {
-      if (!datasetsByLocation[location]) {
-        const color = COLORS[colorIdx++ % COLORS.length];
+    const chartTemp     = makeChart('chart-temp',     'Temperature (°F)');
+    const chartHumidity = makeChart('chart-humidity', 'Humidity (%)');
+    const dsByLocTemp     = {};
+    const dsByLocHumidity = {};
+
+    function ensureDataset(chart, cache, location) {
+      if (!cache[location]) {
+        const color = locationColor(location);
         const ds = { label: location, data: [], borderColor: color, backgroundColor: color + '22', borderWidth: 2, pointRadius: 2, tension: 0.3 };
-        datasetsByLocation[location] = ds;
+        cache[location] = ds;
         chart.data.datasets.push(ds);
       }
-      return datasetsByLocation[location];
+      return cache[location];
     }
 
     function loadHistory() {
       fetch('/api/history').then(r => r.json()).then(h => {
         Object.entries(h).forEach(([loc, pts]) => {
-          const ds = ensureDataset(loc);
-          ds.data = pts.map(p => ({ x: p.ts, y: p.temp_f }));
+          ensureDataset(chartTemp,     dsByLocTemp,     loc).data = pts.map(p => ({ x: p.ts, y: p.temp_f }));
+          ensureDataset(chartHumidity, dsByLocHumidity, loc).data = pts.filter(p => p.humidity != null).map(p => ({ x: p.ts, y: p.humidity }));
         });
-        chart.update();
+        chartTemp.update();
+        chartHumidity.update();
       });
     }
 
@@ -305,10 +322,17 @@ def status():
     const socket = io();
     socket.on('sensor_update', onSensorUpdate);
     socket.on('history_point', ({ location, point }) => {
-      const ds = ensureDataset(location);
-      ds.data.push({ x: point.ts, y: point.temp_f });
-      if (ds.data.length > 300) ds.data.shift();  // cap client-side too
-      chart.update('none');  // 'none' = skip animation for live updates
+      const dsT = ensureDataset(chartTemp,     dsByLocTemp,     location);
+      dsT.data.push({ x: point.ts, y: point.temp_f });
+      if (dsT.data.length > 300) dsT.data.shift();
+      chartTemp.update('none');
+
+      if (point.humidity != null) {
+        const dsH = ensureDataset(chartHumidity, dsByLocHumidity, location);
+        dsH.data.push({ x: point.ts, y: point.humidity });
+        if (dsH.data.length > 300) dsH.data.shift();
+        chartHumidity.update('none');
+      }
     });
     socket.on('connect',    () => { document.getElementById('updated').textContent = 'Connected ✓'; loadHistory(); });
     socket.on('disconnect', () => document.getElementById('updated').textContent = 'Disconnected — reconnecting...');
