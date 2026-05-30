@@ -1,0 +1,450 @@
+#!/usr/bin/env python3
+"""
+Nest Fan Optimizer Hub
+======================
+Receives temperature heartbeats from ESP32-C3 sensor nodes over WiFi,
+calculates the floor-to-floor delta, and controls the Nest fan via SDM API.
+
+Run with:  .venv/bin/python hub.py
+"""
+
+import os
+import time
+import logging
+import threading
+from collections import deque
+from datetime import datetime
+from flask import Flask, request, jsonify
+from flask_socketio import SocketIO
+import requests as req
+from dotenv import load_dotenv
+
+load_dotenv()
+
+# ── Config ────────────────────────────────────────────────────
+SDM_PROJECT_ID        = os.environ["SDM_PROJECT_ID"]
+GOOGLE_CLIENT_ID      = os.environ["GOOGLE_CLIENT_ID"]
+GOOGLE_CLIENT_SECRET  = os.environ["GOOGLE_CLIENT_SECRET"]
+GOOGLE_REFRESH_TOKEN  = os.environ["GOOGLE_REFRESH_TOKEN"]
+
+HUB_PORT              = int(os.getenv("HUB_PORT",              "5001"))
+TEMP_DELTA_THRESHOLD_F = float(os.getenv("TEMP_DELTA_THRESHOLD_F", "3.0"))
+FAN_RUN_DURATION_SECONDS = int(os.getenv("FAN_RUN_DURATION_SECONDS", "1200"))
+SENSOR_STALE_SECONDS  = int(os.getenv("SENSOR_STALE_SECONDS",  "600"))   # ignore readings >10 min old
+CHECK_INTERVAL_SECONDS = int(os.getenv("CHECK_INTERVAL_SECONDS", "120"))  # evaluate fan every 2 min
+
+# ── Logging ───────────────────────────────────────────────────
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s  %(levelname)-8s %(message)s",
+    datefmt="%Y-%m-%d %H:%M:%S",
+)
+log = logging.getLogger(__name__)
+
+# ── Sensor store ──────────────────────────────────────────────
+# { location: { temp_f, humidity, received_at } }
+sensor_data: dict = {}
+# { location: deque([{ts, temp_f, humidity}, ...]) }
+sensor_history: dict = {}
+HISTORY_MAX = 300   # keep last 300 readings per sensor (~2.5 hrs at 30s)
+sensor_lock = threading.Lock()
+
+# ── Flask app (receives heartbeats) ───────────────────────────
+app = Flask(__name__)
+socketio = SocketIO(app, cors_allowed_origins="*")
+
+
+@app.route("/sensor", methods=["POST"])
+def receive_sensor():
+    data = request.get_json(silent=True)
+    if not data or "location" not in data or "temp_f" not in data:
+        return jsonify({"error": "missing fields"}), 400
+
+    location = data["location"]
+    now = time.time()
+    with sensor_lock:
+        sensor_data[location] = {
+            "temp_f":      data["temp_f"],
+            "temp_c":      data.get("temp_c"),
+            "humidity":    data.get("humidity"),
+            "received_at": now,
+        }
+        if location not in sensor_history:
+            sensor_history[location] = deque(maxlen=HISTORY_MAX)
+        sensor_history[location].append({
+            "ts":       now * 1000,   # ms for Chart.js
+            "temp_f":   data["temp_f"],
+            "humidity": data.get("humidity"),
+        })
+
+    log.info("❶ Heartbeat  %-15s  %.1f°F  %s%% RH",
+             location, data["temp_f"], data.get("humidity", "?"))
+
+    # Push live update to all connected browsers
+    socketio.emit("sensor_update", _dashboard_payload())
+    # Push the new history point so charts update without a full reload
+    socketio.emit("history_point", {
+        "location": location,
+        "point":    {"ts": now * 1000, "temp_f": data["temp_f"], "humidity": data.get("humidity")},
+    })
+    return jsonify({"ok": True})
+
+
+def _dashboard_payload() -> dict:
+    """Build the status payload shared by the REST endpoint and WebSocket events."""
+    now = time.time()
+    with sensor_lock:
+        sensors = [
+            {
+                "location":    loc,
+                "temp_f":      d["temp_f"],
+                "humidity":    d.get("humidity"),
+                "age_seconds": int(now - d["received_at"]),
+            }
+            for loc, d in sorted(sensor_data.items())
+        ]
+    temps = [s["temp_f"] for s in sensors]
+    delta = round(max(temps) - min(temps), 1) if len(temps) >= 2 else None
+    return {"sensors": sensors, "delta_f": delta, "threshold_f": TEMP_DELTA_THRESHOLD_F}
+
+
+@app.route("/api/status", methods=["GET"])
+def api_status():
+    return jsonify(_dashboard_payload())
+
+
+@app.route("/api/history", methods=["GET"])
+def api_history():
+    with sensor_lock:
+        return jsonify({
+            loc: list(pts)
+            for loc, pts in sensor_history.items()
+        })
+
+
+@app.route("/status", methods=["GET"])
+def status():
+    """Live dashboard — auto-updates every 10 s without a full page reload."""
+    return """<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <title>Nest Fan Optimizer</title>
+  <style>
+    body  { font-family: system-ui, sans-serif; max-width: 760px; margin: 40px auto; padding: 0 20px; background: #f5f5f5; }
+    h1    { font-size: 1.3rem; color: #333; margin-bottom: 4px; }
+    p.sub { color: #888; font-size: .85rem; margin: 0 0 16px; }
+    .tabs { display: flex; gap: 8px; margin-bottom: 16px; }
+    .tab  { padding: 7px 20px; border-radius: 20px; border: none; cursor: pointer; font-size: .9rem; background: #e0e0e0; color: #555; }
+    .tab.active { background: #1a73e8; color: #fff; }
+    .view { display: none; }
+    .view.active { display: block; }
+    table { width: 100%; border-collapse: collapse; background: #fff; border-radius: 8px; overflow: hidden; box-shadow: 0 1px 4px rgba(0,0,0,.1); }
+    th    { background: #1a73e8; color: #fff; text-align: left; padding: 10px 14px; font-size: .85rem; }
+    td    { padding: 10px 14px; border-bottom: 1px solid #eee; font-size: .95rem; }
+    tr:last-child td { border-bottom: none; }
+    .stale { color: #e53935; }
+    .ok    { color: #43a047; }
+    .delta { margin-top: 16px; padding: 12px 16px; background: #fff; border-radius: 8px; box-shadow: 0 1px 4px rgba(0,0,0,.1); font-size: .95rem; }
+    .delta span { font-weight: 600; }
+    #updated { color: #aaa; font-size: .78rem; margin-top: 12px; }
+    .chart-wrap { background: #fff; border-radius: 8px; padding: 16px; box-shadow: 0 1px 4px rgba(0,0,0,.1); }
+  </style>
+</head>
+<body>
+  <h1>Nest Fan Optimizer</h1>
+  <p class="sub">Updates instantly via WebSocket</p>
+
+  <div class="tabs">
+    <button class="tab active" onclick="switchTab('sensors')">Sensors</button>
+    <button class="tab"        onclick="switchTab('graph')">Graph</button>
+  </div>
+
+  <div id="view-sensors" class="view active">
+    <table>
+      <thead><tr><th>Location</th><th>Temp</th><th>Humidity</th><th>Last seen</th></tr></thead>
+      <tbody id="rows"><tr><td colspan="4" style="color:#aaa">Waiting for sensors...</td></tr></tbody>
+    </table>
+    <div class="delta" id="delta"></div>
+  </div>
+
+  <div id="view-graph" class="view">
+    <div class="chart-wrap"><canvas id="chart"></canvas></div>
+  </div>
+
+  <div id="updated"></div>
+
+  <script src="https://cdn.socket.io/4.7.5/socket.io.min.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.0/dist/chart.umd.min.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/chartjs-adapter-date-fns@3.0.0/dist/chartjs-adapter-date-fns.bundle.min.js"></script>
+  <script>
+    // ── Tab switching ─────────────────────────────────────────
+    function switchTab(name) {
+      document.querySelectorAll('.tab').forEach((t, i) => {
+        const names = ['sensors', 'graph'];
+        t.classList.toggle('active', names[i] === name);
+      });
+      document.querySelectorAll('.view').forEach(v => {
+        v.classList.toggle('active', v.id === 'view-' + name);
+      });
+      if (name === 'graph') chart.resize();
+    }
+
+    // ── Chart ─────────────────────────────────────────────────
+    const COLORS = ['#1a73e8','#e53935','#43a047','#fb8c00','#8e24aa','#00acc1'];
+    let colorIdx = 0;
+    const datasetsByLocation = {};   // { location: Chart.js dataset }
+
+    const chart = new Chart(document.getElementById('chart'), {
+      type: 'line',
+      data: { datasets: [] },
+      options: {
+        animation: false,
+        responsive: true,
+        interaction: { mode: 'index', intersect: false },
+        plugins: { legend: { position: 'top' } },
+        scales: {
+          x: { type: 'time', time: { tooltipFormat: 'h:mm:ss a', displayFormats: { minute: 'h:mm a', hour: 'h a' } }, title: { display: true, text: 'Time' } },
+          y: { title: { display: true, text: 'Temperature (°F)' } },
+        },
+      },
+    });
+
+    function ensureDataset(location) {
+      if (!datasetsByLocation[location]) {
+        const color = COLORS[colorIdx++ % COLORS.length];
+        const ds = { label: location, data: [], borderColor: color, backgroundColor: color + '22', borderWidth: 2, pointRadius: 2, tension: 0.3 };
+        datasetsByLocation[location] = ds;
+        chart.data.datasets.push(ds);
+      }
+      return datasetsByLocation[location];
+    }
+
+    function loadHistory() {
+      fetch('/api/history').then(r => r.json()).then(h => {
+        Object.entries(h).forEach(([loc, pts]) => {
+          const ds = ensureDataset(loc);
+          ds.data = pts.map(p => ({ x: p.ts, y: p.temp_f }));
+        });
+        chart.update();
+      });
+    }
+
+    // ── Age countdown ─────────────────────────────────────────
+    const seenAt = {};   // { location: Date.now() when reading arrived }
+
+    function fmtAge(ms) {
+      const s = Math.floor(ms / 1000);
+      if (s < 60)   return s + 's ago';
+      if (s < 3600) return Math.floor(s / 60) + 'm ' + (s % 60) + 's ago';
+      return Math.floor(s / 3600) + 'h ago';
+    }
+
+    function tickAges() {
+      const now = Date.now();
+      document.querySelectorAll('[data-location]').forEach(el => {
+        const loc = el.dataset.location;
+        if (!seenAt[loc]) return;
+        const ms    = now - seenAt[loc];
+        const stale = ms > 600000;
+        el.className = stale ? 'stale' : 'ok';
+        el.textContent = fmtAge(ms);
+      });
+    }
+
+    function render(d) {
+      const now   = Date.now();
+      const tbody = document.getElementById('rows');
+
+      if (!d.sensors.length) {
+        tbody.innerHTML = '<tr><td colspan="4" style="color:#aaa">Waiting for sensors...</td></tr>';
+      } else {
+        tbody.innerHTML = d.sensors.map(s => {
+          // Anchor the timestamp: if we have a local record use it, otherwise
+          // back-calculate from age_seconds so the counter starts correctly.
+          if (!seenAt[s.location]) seenAt[s.location] = now - s.age_seconds * 1000;
+          const ms    = now - seenAt[s.location];
+          const stale = ms > 600000;
+          return `<tr>
+            <td>${s.location}</td>
+            <td>${s.temp_f.toFixed(1)} °F</td>
+            <td>${s.humidity ?? '—'} %</td>
+            <td class="${stale ? 'stale' : 'ok'}" data-location="${s.location}">${fmtAge(ms)}</td>
+          </tr>`;
+        }).join('');
+      }
+
+      const deltaEl = document.getElementById('delta');
+      if (d.delta_f !== null) {
+        const over = d.delta_f > d.threshold_f;
+        deltaEl.innerHTML = `Floor delta: <span>${d.delta_f.toFixed(1)} °F</span> &nbsp;|&nbsp; `
+          + `Threshold: ${d.threshold_f} °F &nbsp;|&nbsp; `
+          + `Fan: <span class="${over ? 'stale' : 'ok'}">${over ? 'RUNNING' : 'OFF'}</span>`;
+      } else {
+        deltaEl.innerHTML = 'Waiting for 2+ sensors to compute delta...';
+      }
+
+      document.getElementById('updated').textContent = 'Updated ' + new Date().toLocaleTimeString();
+    }
+
+    function onSensorUpdate(d) {
+      // Reset the timestamp for any sensor that just sent a reading
+      const now = Date.now();
+      d.sensors.forEach(s => { seenAt[s.location] = now - s.age_seconds * 1000; });
+      render(d);
+    }
+
+    // Tick the age counters every second
+    setInterval(tickAges, 1000);
+
+    // Load current state immediately on page open
+    fetch('/api/status').then(r => r.json()).then(render);
+    loadHistory();
+
+    // Live updates via WebSocket — no polling needed
+    const socket = io();
+    socket.on('sensor_update', onSensorUpdate);
+    socket.on('history_point', ({ location, point }) => {
+      const ds = ensureDataset(location);
+      ds.data.push({ x: point.ts, y: point.temp_f });
+      if (ds.data.length > 300) ds.data.shift();  // cap client-side too
+      chart.update('none');  // 'none' = skip animation for live updates
+    });
+    socket.on('connect',    () => { document.getElementById('updated').textContent = 'Connected ✓'; loadHistory(); });
+    socket.on('disconnect', () => document.getElementById('updated').textContent = 'Disconnected — reconnecting...');
+  </script>
+</body>
+</html>""", 200
+
+
+# ── SDM helpers ───────────────────────────────────────────────
+TOKEN_URL = "https://oauth2.googleapis.com/token"
+SDM_BASE  = "https://smartdevicemanagement.googleapis.com/v1"
+
+_token_cache: dict = {}
+
+
+def get_access_token() -> str:
+    if _token_cache.get("expires_at", 0) > time.time() + 60:
+        return _token_cache["token"]
+    resp = req.post(TOKEN_URL, data={
+        "client_id":     GOOGLE_CLIENT_ID,
+        "client_secret": GOOGLE_CLIENT_SECRET,
+        "refresh_token": GOOGLE_REFRESH_TOKEN,
+        "grant_type":    "refresh_token",
+    }, timeout=10)
+    resp.raise_for_status()
+    j = resp.json()
+    _token_cache["token"] = j["access_token"]
+    _token_cache["expires_at"] = time.time() + j.get("expires_in", 3600)
+    return _token_cache["token"]
+
+
+def list_devices(token: str) -> list:
+    resp = req.get(
+        f"{SDM_BASE}/enterprises/{SDM_PROJECT_ID}/devices",
+        headers={"Authorization": f"Bearer {token}"},
+        timeout=10,
+    )
+    resp.raise_for_status()
+    return resp.json().get("devices", [])
+
+
+def find_thermostat(token: str) -> dict | None:
+    for d in list_devices(token):
+        if "sdm.devices.traits.Fan" in d.get("traits", {}):
+            return d
+    return None
+
+
+def fan_mode(device: dict) -> str:
+    return device["traits"].get("sdm.devices.traits.Fan", {}).get("timerMode", "OFF")
+
+
+def set_fan(device_name: str, mode: str, duration_s: int | None, token: str):
+    params: dict = {"timerMode": mode}
+    if mode == "ON" and duration_s:
+        params["duration"] = f"{duration_s}s"
+    resp = req.post(
+        f"{SDM_BASE}/{device_name}:executeCommand",
+        json={"command": "sdm.devices.commands.Fan.SetTimer", "params": params},
+        headers={"Authorization": f"Bearer {token}", "Content-Type": "application/json"},
+        timeout=10,
+    )
+    resp.raise_for_status()
+    log.info("Fan → %s%s", mode,
+             f" for {duration_s // 60} min" if mode == "ON" and duration_s else "")
+
+
+# ── Fan control loop ──────────────────────────────────────────
+def fan_control_loop():
+    log.info("Fan control loop started (checks every %ds)", CHECK_INTERVAL_SECONDS)
+    while True:
+        time.sleep(CHECK_INTERVAL_SECONDS)
+        try:
+            evaluate_and_act()
+        except Exception as exc:
+            log.error("Fan control error: %s", exc, exc_info=True)
+
+
+def evaluate_and_act():
+    now = time.time()
+
+    with sensor_lock:
+        fresh = {
+            loc: d for loc, d in sensor_data.items()
+            if now - d["received_at"] <= SENSOR_STALE_SECONDS
+        }
+
+    if len(fresh) < 2:
+        log.warning("Only %d fresh sensor(s) — need ≥2 to compute delta. "
+                    "Waiting for more heartbeats.", len(fresh))
+        return
+
+    temps = {loc: d["temp_f"] for loc, d in fresh.items()}
+    max_temp = max(temps.values())
+    min_temp = min(temps.values())
+    delta = max_temp - min_temp
+    hot_loc = max(temps, key=temps.get)
+    cold_loc = min(temps, key=temps.get)
+
+    log.info("Δ %.1f°F  |  %s=%.1f°F (hot)  %s=%.1f°F (cold)  |  threshold=%.1f°F",
+             delta, hot_loc, max_temp, cold_loc, min_temp, TEMP_DELTA_THRESHOLD_F)
+
+    token     = get_access_token()
+    thermostat = find_thermostat(token)
+    if thermostat is None:
+        log.error("No thermostat found via SDM API.")
+        return
+
+    current_mode = fan_mode(thermostat)
+    device_name  = thermostat["name"]
+
+    if delta > TEMP_DELTA_THRESHOLD_F:
+        log.info("Above threshold → fan ON (%d min)", FAN_RUN_DURATION_SECONDS // 60)
+        set_fan(device_name, "ON", FAN_RUN_DURATION_SECONDS, token)
+    else:
+        if current_mode == "ON":
+            log.info("Within threshold → fan OFF")
+            set_fan(device_name, "OFF", None, token)
+        else:
+            log.info("Within threshold → fan already OFF. Nothing to do.")
+
+
+# ── Entry point ───────────────────────────────────────────────
+if __name__ == "__main__":
+    log.info("═" * 60)
+    log.info("Nest Fan Optimizer Hub starting")
+    log.info("  Listening    : http://0.0.0.0:%d/sensor", HUB_PORT)
+    log.info("  Dashboard    : http://localhost:%d/status", HUB_PORT)
+    log.info("  Threshold    : %.1f°F delta", TEMP_DELTA_THRESHOLD_F)
+    log.info("  Fan duration : %d min", FAN_RUN_DURATION_SECONDS // 60)
+    log.info("  Stale after  : %ds", SENSOR_STALE_SECONDS)
+    log.info("═" * 60)
+
+    # Start fan control loop in background thread
+    t = threading.Thread(target=fan_control_loop, daemon=True)
+    t.start()
+
+    # Start Flask-SocketIO (blocks)
+    socketio.run(app, host="0.0.0.0", port=HUB_PORT, debug=False, allow_unsafe_werkzeug=True)
