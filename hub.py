@@ -53,8 +53,9 @@ HISTORY_MAX = 300   # keep last 300 readings per sensor (~2.5 hrs at 30s)
 sensor_lock = threading.Lock()
 
 # ── Fan event log ─────────────────────────────────────────────
-# [{ ts_ms, state: "ON"|"OFF" }, ...]
-fan_events: deque = deque(maxlen=200)
+# [{ ts_ms, state: "ON"|"OFF" }, ...]  — only state-change events
+fan_events: deque = deque(maxlen=500)
+_last_fan_state: str = "OFF"   # track last state so we only log changes
 
 # ── Database ──────────────────────────────────────────────────
 DB_PATH = os.getenv("DB_PATH", "nest.db")
@@ -303,18 +304,17 @@ def status():
       const boxes = {};
       let onTs = null;
       fanEventsCache.forEach(e => {
-        if (e.state === 'ON')  { onTs = e.ts; }
+        if (e.state === 'ON'  && onTs === null) { onTs = e.ts; }   // OFF→ON only
         if (e.state === 'OFF' && onTs !== null) {
-          const id = 'fan_' + onTs;
-          boxes[id] = { type: 'box', xMin: onTs, xMax: e.ts, yScaleID: 'y',
-            backgroundColor: 'rgba(26,115,232,0.10)', borderWidth: 0 };
+          boxes['fan_' + onTs] = { type: 'box', xMin: onTs, xMax: e.ts,
+            backgroundColor: 'rgba(26,115,232,0.12)', borderWidth: 0 };
           onTs = null;
         }
       });
-      // Still running — shade to now
+      // Fan still running — shade up to now
       if (onTs !== null) {
-        boxes['fan_open'] = { type: 'box', xMin: onTs, xMax: Date.now(), yScaleID: 'y',
-          backgroundColor: 'rgba(26,115,232,0.10)', borderWidth: 0 };
+        boxes['fan_open'] = { type: 'box', xMin: onTs, xMax: Date.now(),
+          backgroundColor: 'rgba(26,115,232,0.12)', borderWidth: 0 };
       }
       return boxes;
     }
@@ -536,11 +536,14 @@ def set_fan(device_name: str, mode: str, duration_s: int | None, token: str):
     resp.raise_for_status()
     log.info("Fan → %s%s", mode,
              f" for {duration_s // 60} min" if mode == "ON" and duration_s else "")
-    event = {"ts": time.time() * 1000, "state": mode}
-    fan_events.append(event)
-    socketio.emit("fan_event", event)
-    threading.Thread(target=db_write_fan_event, daemon=True,
-                     args=(event["ts"], mode)).start()
+    global _last_fan_state
+    if mode != _last_fan_state:
+        _last_fan_state = mode
+        event = {"ts": time.time() * 1000, "state": mode}
+        fan_events.append(event)
+        socketio.emit("fan_event", event)
+        threading.Thread(target=db_write_fan_event, daemon=True,
+                         args=(event["ts"], mode)).start()
 
 
 # ── Quiet hours ───────────────────────────────────────────────
