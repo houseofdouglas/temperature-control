@@ -32,6 +32,8 @@ TEMP_DELTA_THRESHOLD_F = float(os.getenv("TEMP_DELTA_THRESHOLD_F", "3.0"))
 FAN_RUN_DURATION_SECONDS = int(os.getenv("FAN_RUN_DURATION_SECONDS", "1200"))
 SENSOR_STALE_SECONDS  = int(os.getenv("SENSOR_STALE_SECONDS",  "600"))   # ignore readings >10 min old
 CHECK_INTERVAL_SECONDS = int(os.getenv("CHECK_INTERVAL_SECONDS", "120"))  # evaluate fan every 2 min
+FAN_QUIET_START       = os.getenv("FAN_QUIET_START", "22:00")   # fan off after this time
+FAN_QUIET_END         = os.getenv("FAN_QUIET_END",   "06:30")   # fan back on after this time
 
 # ── Logging ───────────────────────────────────────────────────
 logging.basicConfig(
@@ -400,6 +402,22 @@ def set_fan(device_name: str, mode: str, duration_s: int | None, token: str):
              f" for {duration_s // 60} min" if mode == "ON" and duration_s else "")
 
 
+# ── Quiet hours ───────────────────────────────────────────────
+def _parse_hhmm(s: str):
+    h, m = map(int, s.split(":"))
+    return h * 60 + m
+
+def in_quiet_hours() -> bool:
+    from datetime import datetime
+    now  = datetime.now()
+    mins = now.hour * 60 + now.minute
+    start = _parse_hhmm(FAN_QUIET_START)
+    end   = _parse_hhmm(FAN_QUIET_END)
+    if start > end:          # spans midnight (e.g. 22:00 → 06:30)
+        return mins >= start or mins < end
+    return start <= mins < end
+
+
 # ── Fan control loop ──────────────────────────────────────────
 def fan_control_loop():
     log.info("Fan control loop started (checks every %ds)", CHECK_INTERVAL_SECONDS)
@@ -475,6 +493,13 @@ def evaluate_and_act():
 
     current_mode = fan_mode(thermostat)
     device_name  = thermostat["name"]
+
+    if in_quiet_hours():
+        log.info("Quiet hours (%s–%s) — fan suppressed", FAN_QUIET_START, FAN_QUIET_END)
+        if current_mode == "ON":
+            log.info("Turning fan OFF for quiet hours")
+            set_fan(device_name, "OFF", None, token)
+        return
 
     if delta > TEMP_DELTA_THRESHOLD_F:
         log.info("Above threshold → fan ON (%d min)", FAN_RUN_DURATION_SECONDS // 60)
