@@ -51,6 +51,10 @@ sensor_history: dict = {}
 HISTORY_MAX = 300   # keep last 300 readings per sensor (~2.5 hrs at 30s)
 sensor_lock = threading.Lock()
 
+# ── Fan event log ─────────────────────────────────────────────
+# [{ ts_ms, state: "ON"|"OFF" }, ...]
+fan_events: deque = deque(maxlen=200)
+
 # ── Flask app (receives heartbeats) ───────────────────────────
 app = Flask(__name__)
 socketio = SocketIO(app, cors_allowed_origins="*")
@@ -124,6 +128,11 @@ def api_history():
         })
 
 
+@app.route("/api/fan_events", methods=["GET"])
+def api_fan_events():
+    return jsonify(list(fan_events))
+
+
 @app.route("/status", methods=["GET"])
 def status():
     """Live dashboard — auto-updates every 10 s without a full page reload."""
@@ -183,6 +192,7 @@ def status():
   <script src="https://cdn.socket.io/4.7.5/socket.io.min.js"></script>
   <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.0/dist/chart.umd.min.js"></script>
   <script src="https://cdn.jsdelivr.net/npm/chartjs-adapter-date-fns@3.0.0/dist/chartjs-adapter-date-fns.bundle.min.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/chartjs-plugin-annotation@3.0.1/dist/chartjs-plugin-annotation.min.js"></script>
   <script>
     // ── Tab switching ─────────────────────────────────────────
     function switchTab(name) {
@@ -206,6 +216,44 @@ def status():
       return colorByLocation[loc];
     }
 
+    // ── Fan overlay helpers ───────────────────────────────────
+    let fanEventsCache = [];   // [{ts, state}] sorted by time
+
+    function buildAnnotations() {
+      const boxes = {};
+      let onTs = null;
+      fanEventsCache.forEach(e => {
+        if (e.state === 'ON')  { onTs = e.ts; }
+        if (e.state === 'OFF' && onTs !== null) {
+          const id = 'fan_' + onTs;
+          boxes[id] = { type: 'box', xMin: onTs, xMax: e.ts, yScaleID: 'y',
+            backgroundColor: 'rgba(26,115,232,0.10)', borderWidth: 0 };
+          onTs = null;
+        }
+      });
+      // Still running — shade to now
+      if (onTs !== null) {
+        boxes['fan_open'] = { type: 'box', xMin: onTs, xMax: Date.now(), yScaleID: 'y',
+          backgroundColor: 'rgba(26,115,232,0.10)', borderWidth: 0 };
+      }
+      return boxes;
+    }
+
+    function refreshAnnotations() {
+      const boxes = buildAnnotations();
+      [chartTemp, chartHumidity].forEach(c => {
+        c.options.plugins.annotation.annotations = boxes;
+        c.update('none');
+      });
+    }
+
+    function loadFanEvents() {
+      fetch('/api/fan_events').then(r => r.json()).then(evts => {
+        fanEventsCache = evts;
+        refreshAnnotations();
+      });
+    }
+
     function makeChart(canvasId, yLabel) {
       return new Chart(document.getElementById(canvasId), {
         type: 'line',
@@ -214,7 +262,10 @@ def status():
           animation: false,
           responsive: true,
           interaction: { mode: 'index', intersect: false },
-          plugins: { legend: { position: 'top' } },
+          plugins: {
+            legend: { position: 'top' },
+            annotation: { annotations: {} },
+          },
           scales: {
             x: { type: 'time', time: { tooltipFormat: 'h:mm:ss a', displayFormats: { minute: 'h:mm a', hour: 'h a' } } },
             y: { title: { display: true, text: yLabel } },
@@ -319,10 +370,15 @@ def status():
     // Load current state immediately on page open
     fetch('/api/status').then(r => r.json()).then(render);
     loadHistory();
+    loadFanEvents();
 
     // Live updates via WebSocket — no polling needed
     const socket = io();
     socket.on('sensor_update', onSensorUpdate);
+    socket.on('fan_event', evt => {
+      fanEventsCache.push(evt);
+      refreshAnnotations();
+    });
     socket.on('history_point', ({ location, point }) => {
       const dsT = ensureDataset(chartTemp,     dsByLocTemp,     location);
       dsT.data.push({ x: point.ts, y: point.temp_f });
@@ -336,7 +392,7 @@ def status():
         chartHumidity.update('none');
       }
     });
-    socket.on('connect',    () => { document.getElementById('updated').textContent = 'Connected ✓'; loadHistory(); });
+    socket.on('connect',    () => { document.getElementById('updated').textContent = 'Connected ✓'; loadHistory(); loadFanEvents(); });
     socket.on('disconnect', () => document.getElementById('updated').textContent = 'Disconnected — reconnecting...');
   </script>
 </body>
@@ -400,6 +456,9 @@ def set_fan(device_name: str, mode: str, duration_s: int | None, token: str):
     resp.raise_for_status()
     log.info("Fan → %s%s", mode,
              f" for {duration_s // 60} min" if mode == "ON" and duration_s else "")
+    event = {"ts": time.time() * 1000, "state": mode}
+    fan_events.append(event)
+    socketio.emit("fan_event", event)
 
 
 # ── Quiet hours ───────────────────────────────────────────────
