@@ -11,6 +11,7 @@ Run with:  .venv/bin/python hub.py
 import os
 import time
 import logging
+import sqlite3
 import threading
 from collections import deque
 from datetime import datetime
@@ -55,6 +56,82 @@ sensor_lock = threading.Lock()
 # [{ ts_ms, state: "ON"|"OFF" }, ...]
 fan_events: deque = deque(maxlen=200)
 
+# ── Database ──────────────────────────────────────────────────
+DB_PATH = os.getenv("DB_PATH", "nest.db")
+
+def db_connect():
+    conn = sqlite3.connect(DB_PATH)
+    conn.row_factory = sqlite3.Row
+    return conn
+
+def db_init():
+    with db_connect() as conn:
+        conn.executescript("""
+            CREATE TABLE IF NOT EXISTS sensor_readings (
+                id        INTEGER PRIMARY KEY AUTOINCREMENT,
+                ts        REAL    NOT NULL,
+                location  TEXT    NOT NULL,
+                temp_f    REAL    NOT NULL,
+                temp_c    REAL,
+                humidity  INTEGER
+            );
+            CREATE INDEX IF NOT EXISTS idx_readings_ts       ON sensor_readings(ts);
+            CREATE INDEX IF NOT EXISTS idx_readings_location ON sensor_readings(location, ts);
+
+            CREATE TABLE IF NOT EXISTS fan_events (
+                id    INTEGER PRIMARY KEY AUTOINCREMENT,
+                ts    REAL    NOT NULL,
+                state TEXT    NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS idx_fan_ts ON fan_events(ts);
+        """)
+    log.info("Database ready: %s", DB_PATH)
+
+def db_write_reading(ts, location, temp_f, temp_c, humidity):
+    try:
+        with db_connect() as conn:
+            conn.execute(
+                "INSERT INTO sensor_readings (ts, location, temp_f, temp_c, humidity) VALUES (?,?,?,?,?)",
+                (ts, location, temp_f, temp_c, humidity)
+            )
+    except Exception as e:
+        log.error("DB write reading error: %s", e)
+
+def db_write_fan_event(ts_ms, state):
+    try:
+        with db_connect() as conn:
+            conn.execute("INSERT INTO fan_events (ts, state) VALUES (?,?)",
+                         (ts_ms, state))
+    except Exception as e:
+        log.error("DB write fan event error: %s", e)
+
+def db_load_history():
+    """Preload recent sensor readings and fan events into in-memory stores on startup."""
+    cutoff = time.time() - 86400   # last 24 hours
+    with db_connect() as conn:
+        rows = conn.execute(
+            "SELECT ts, location, temp_f, humidity FROM sensor_readings "
+            "WHERE ts >= ? ORDER BY ts ASC", (cutoff,)
+        ).fetchall()
+        for r in rows:
+            loc = r["location"]
+            if loc not in sensor_history:
+                sensor_history[loc] = deque(maxlen=HISTORY_MAX)
+            sensor_history[loc].append({
+                "ts":       r["ts"] * 1000,
+                "temp_f":   r["temp_f"],
+                "humidity": r["humidity"],
+            })
+
+        evts = conn.execute(
+            "SELECT ts, state FROM fan_events WHERE ts >= ? ORDER BY ts ASC",
+            (cutoff * 1000,)
+        ).fetchall()
+        for e in evts:
+            fan_events.append({"ts": e["ts"], "state": e["state"]})
+
+    log.info("Loaded %d sensor rows and %d fan events from DB", len(rows), len(evts))
+
 # ── Flask app (receives heartbeats) ───────────────────────────
 app = Flask(__name__)
 socketio = SocketIO(app, cors_allowed_origins="*")
@@ -85,6 +162,9 @@ def receive_sensor():
 
     log.info("❶ Heartbeat  %-15s  %.1f°F  %s%% RH",
              location, data["temp_f"], data.get("humidity", "?"))
+
+    threading.Thread(target=db_write_reading, daemon=True,
+                     args=(now, location, data["temp_f"], data.get("temp_c"), data.get("humidity"))).start()
 
     # Push live update to all connected browsers
     socketio.emit("sensor_update", _dashboard_payload())
@@ -459,6 +539,8 @@ def set_fan(device_name: str, mode: str, duration_s: int | None, token: str):
     event = {"ts": time.time() * 1000, "state": mode}
     fan_events.append(event)
     socketio.emit("fan_event", event)
+    threading.Thread(target=db_write_fan_event, daemon=True,
+                     args=(event["ts"], mode)).start()
 
 
 # ── Quiet hours ───────────────────────────────────────────────
@@ -544,6 +626,8 @@ def evaluate_and_act():
             })
         log.info("❶ Nest         %-15s  %.1f°F  %s%% RH  fan=%s",
                  location, temp_f, humidity or "?", fan_mode(thermostat))
+        threading.Thread(target=db_write_reading, daemon=True,
+                         args=(ts, location, temp_f, round(temp_c, 1), humidity)).start()
         socketio.emit("sensor_update", _dashboard_payload())
         socketio.emit("history_point", {
             "location": location,
@@ -581,6 +665,10 @@ if __name__ == "__main__":
     log.info("  Fan duration : %d min", FAN_RUN_DURATION_SECONDS // 60)
     log.info("  Stale after  : %ds", SENSOR_STALE_SECONDS)
     log.info("═" * 60)
+
+    # Init database and preload history
+    db_init()
+    db_load_history()
 
     # Start fan control loop in background thread
     t = threading.Thread(target=fan_control_loop, daemon=True)
