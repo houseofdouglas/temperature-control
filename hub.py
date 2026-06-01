@@ -49,7 +49,7 @@ log = logging.getLogger(__name__)
 sensor_data: dict = {}
 # { location: deque([{ts, temp_f, humidity}, ...]) }
 sensor_history: dict = {}
-HISTORY_MAX = 300   # keep last 300 readings per sensor (~2.5 hrs at 30s)
+HISTORY_MAX = 1000  # keep last 1000 readings per sensor (~3.5 days at 5 min)
 sensor_lock = threading.Lock()
 
 # ── Fan event log ─────────────────────────────────────────────
@@ -108,7 +108,7 @@ def db_write_fan_event(ts_ms, state):
 
 def db_load_history():
     """Preload recent sensor readings and fan events into in-memory stores on startup."""
-    cutoff = time.time() - 86400   # last 24 hours
+    cutoff = time.time() - 259200  # last 3 days
     with db_connect() as conn:
         rows = conn.execute(
             "SELECT ts, location, temp_f, humidity FROM sensor_readings "
@@ -262,7 +262,10 @@ def status():
   </div>
 
   <div id="view-graph" class="view">
-    <p class="chart-label">Temperature (°F)</p>
+    <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:6px;">
+      <p class="chart-label" style="margin:0">Temperature (°F)</p>
+      <button onclick="resetZoom()" style="font-size:.8rem; padding:4px 12px; border-radius:12px; border:1px solid #ccc; background:#fff; cursor:pointer; color:#555;">Reset view</button>
+    </div>
     <div class="chart-wrap"><canvas id="chart-temp"></canvas></div>
     <p class="chart-label">Humidity (%)</p>
     <div class="chart-wrap"><canvas id="chart-humidity"></canvas></div>
@@ -274,6 +277,8 @@ def status():
   <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.0/dist/chart.umd.min.js"></script>
   <script src="https://cdn.jsdelivr.net/npm/chartjs-adapter-date-fns@3.0.0/dist/chartjs-adapter-date-fns.bundle.min.js"></script>
   <script src="https://cdn.jsdelivr.net/npm/chartjs-plugin-annotation@3.0.1/dist/chartjs-plugin-annotation.min.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/hammerjs@2.0.8/hammer.min.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/chartjs-plugin-zoom@2.0.1/dist/chartjs-plugin-zoom.min.js"></script>
   <script>
     // ── Tab switching ─────────────────────────────────────────
     function switchTab(name) {
@@ -284,7 +289,7 @@ def status():
       document.querySelectorAll('.view').forEach(v => {
         v.classList.toggle('active', v.id === 'view-' + name);
       });
-      if (name === 'graph') { chartTemp.resize(); chartHumidity.resize(); }
+      if (name === 'graph') { chartTemp.resize(); chartHumidity.resize(); resetZoom(); }
     }
 
     // ── Charts ────────────────────────────────────────────────
@@ -334,6 +339,9 @@ def status():
       });
     }
 
+    const WINDOW_12H  = 12 * 3600 * 1000;
+    const WINDOW_3DAY = 3  * 86400 * 1000;
+
     function makeChart(canvasId, yLabel) {
       return new Chart(document.getElementById(canvasId), {
         type: 'line',
@@ -345,12 +353,36 @@ def status():
           plugins: {
             legend: { position: 'top' },
             annotation: { annotations: {} },
+            zoom: {
+              limits: {
+                x: { min: Date.now() - WINDOW_3DAY, minRange: 3600000 },
+              },
+              pan:  { enabled: true, mode: 'x' },
+              zoom: {
+                wheel:  { enabled: true },
+                pinch:  { enabled: true },
+                mode:   'x',
+              },
+            },
           },
           scales: {
-            x: { type: 'time', time: { tooltipFormat: 'h:mm:ss a', displayFormats: { minute: 'h:mm a', hour: 'h a' } } },
+            x: {
+              type: 'time',
+              min:  Date.now() - WINDOW_12H,
+              time: { tooltipFormat: 'h:mm:ss a', displayFormats: { minute: 'h:mm a', hour: 'h a' } },
+            },
             y: { title: { display: true, text: yLabel } },
           },
         },
+      });
+    }
+
+    function resetZoom() {
+      const now = Date.now();
+      [chartTemp, chartHumidity].forEach(c => {
+        c.options.scales.x.min = now - WINDOW_12H;
+        c.options.scales.x.max = undefined;
+        c.resetZoom();
       });
     }
 
