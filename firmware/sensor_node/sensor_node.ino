@@ -1,41 +1,49 @@
 /**
- * Nest Fan Optimizer — ESP32-C3 Sensor Node
- * ==========================================
- * Reads a DHT11 temperature/humidity sensor and POSTs a JSON
- * heartbeat to the hub every INTERVAL_MS milliseconds.
+ * Nest Fan Optimizer — ESP32-C3 Sensor Node (Deep Sleep)
+ * =======================================================
+ * On each wake cycle:
+ *   1. Connect to WiFi
+ *   2. Read DHT11
+ *   3. POST heartbeat to hub
+ *   4. Deep sleep for INTERVAL_MS
+ *
+ * Deep sleep draws ~5µA vs ~80mA when idle — dramatically extends
+ * battery life for sensors without a permanent power source.
  *
  * Arduino IDE setup:
- *   1. File → Preferences → Additional boards URL:
- *      https://raw.githubusercontent.com/espressif/arduino-esp32/gh-pages/package_esp32_index.json
- *   2. Tools → Board Manager → search "esp32" → install "esp32 by Espressif"
- *   3. Tools → Board → ESP32C3 Dev Module
- *   4. Tools → USB CDC On Boot → Enabled  (so Serial works over USB)
+ *   Tools → Board     → ESP32C3 Dev Module
+ *   Tools → USB CDC On Boot → Enabled   (for Serial over USB)
  *
- * Libraries (Sketch → Include Library → Manage Libraries):
+ * Libraries (Library Manager):
  *   - "DHT sensor library" by Adafruit
- *   - "Adafruit Unified Sensor" by Adafruit  (dependency)
+ *   - "Adafruit Unified Sensor" by Adafruit
  *
  * Wiring:
  *   DHT11 VCC  → 3.3V
  *   DHT11 GND  → GND
- *   DHT11 DATA → GPIO 2   (set DHT_PIN in config.h)
+ *   DHT11 DATA → GPIO pin set in config.h (default: 2)
+ *
+ * Battery wiring:
+ *   Battery (+) → 3.3V pin  (supply must be 2.7–3.6V)
+ *   Battery (-) → GND pin
  */
 
 #include <WiFi.h>
 #include <HTTPClient.h>
 #include <DHT.h>
+#include "esp_sleep.h"
 #include "config.h"
 
-// ── Hardware ─────────────────────────────────────────────────
-#define DHTTYPE     DHT11
-#define LED_PIN     8       // onboard LED on ESP32-C3 Supermini (active LOW)
+#define DHTTYPE  DHT11
+#define LED_PIN  8      // onboard LED, active LOW on C3 Supermini
 
 DHT dht(DHT_PIN, DHTTYPE);
 
 // ── Helpers ───────────────────────────────────────────────────
-void blink(int times, int ms = 150) {
+
+void blink(int times, int ms = 120) {
   for (int i = 0; i < times; i++) {
-    digitalWrite(LED_PIN, LOW);   // active low
+    digitalWrite(LED_PIN, LOW);
     delay(ms);
     digitalWrite(LED_PIN, HIGH);
     delay(ms);
@@ -43,96 +51,94 @@ void blink(int times, int ms = 150) {
 }
 
 bool connectWifi() {
-  if (WiFi.status() == WL_CONNECTED) return true;
-
-  Serial.printf("Connecting to %s", WIFI_SSID);
+  WiFi.mode(WIFI_STA);
   WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
-
-  for (int i = 0; i < 30; i++) {   // up to 15 s
+  Serial.printf("Connecting to %s", WIFI_SSID);
+  for (int i = 0; i < 30; i++) {     // 15 s timeout
     if (WiFi.status() == WL_CONNECTED) {
-      Serial.printf("\nConnected! IP: %s\n", WiFi.localIP().toString().c_str());
-      blink(3);   // triple-blink = WiFi OK
+      Serial.printf("\nConnected: %s\n", WiFi.localIP().toString().c_str());
+      blink(3);
       return true;
     }
     delay(500);
     Serial.print(".");
   }
-
-  Serial.println("\nWiFi FAILED");
-  blink(10, 80);   // rapid blink = error
+  Serial.println("\nWiFi timeout");
   return false;
 }
 
-// ── Heartbeat ─────────────────────────────────────────────────
-void sendHeartbeat() {
-  // Read sensor (DHT11 needs ~1 s between reads)
-  float temp_f   = dht.readTemperature(/*Fahrenheit=*/true);
-  float temp_c   = dht.readTemperature(/*Fahrenheit=*/false);
-  float humidity = dht.readHumidity();
-
-  if (isnan(temp_f) || isnan(humidity)) {
-    Serial.println("Sensor read failed — skipping heartbeat");
-    blink(5, 80);
-    return;
-  }
-
-  // Build JSON payload
+void sendHeartbeat(float temp_f, float temp_c, float humidity) {
   String body = String("{")
-    + "\"location\":\"" + LOCATION + "\","
+    + "\"location\":\"" + LOCATION      + "\","
     + "\"temp_f\":"     + String(temp_f,   1) + ","
     + "\"temp_c\":"     + String(temp_c,   1) + ","
     + "\"humidity\":"   + String(humidity, 0)
     + "}";
 
-  Serial.printf("[%s] Sending: %s\n", LOCATION, body.c_str());
+  Serial.printf("[%s] %s\n", LOCATION, body.c_str());
 
   HTTPClient http;
   http.begin(HUB_URL);
   http.addHeader("Content-Type", "application/json");
-  http.setTimeout(10000);
-
+  http.setTimeout(8000);
   int code = http.POST(body);
-
-  if (code == 200) {
-    Serial.printf("OK (HTTP %d)\n", code);
-    blink(1);   // single blink = success
-  } else {
-    Serial.printf("Error (HTTP %d)\n", code);
-    blink(5, 80);
-  }
-
+  Serial.printf("HTTP %d\n", code);
   http.end();
+
+  blink(code == 200 ? 1 : 5, code == 200 ? 120 : 60);
 }
 
-// ── Arduino lifecycle ─────────────────────────────────────────
+void goToSleep() {
+  Serial.printf("Sleeping %d s...\n", INTERVAL_MS / 1000);
+  Serial.flush();
+  WiFi.disconnect(true);
+  WiFi.mode(WIFI_OFF);
+  esp_sleep_enable_timer_wakeup((uint64_t)INTERVAL_MS * 1000ULL);  // µs
+  esp_deep_sleep_start();
+  // execution never reaches here
+}
+
+// ── Main — runs once per wake cycle ───────────────────────────
+
 void setup() {
   Serial.begin(115200);
-  delay(500);
+  delay(200);
 
   pinMode(LED_PIN, OUTPUT);
-  digitalWrite(LED_PIN, HIGH);   // LED off (active low)
+  digitalWrite(LED_PIN, HIGH);   // LED off
 
-  Serial.printf("\nSensor node — location: %s\n", LOCATION);
-  Serial.printf("Hub: %s\n", HUB_URL);
+  Serial.printf("\n=== Wake: %s ===\n", LOCATION);
 
   dht.begin();
+  delay(1000);   // DHT11 needs ~1 s to stabilise after power-up
 
-  if (!connectWifi()) {
-    Serial.println("Rebooting in 30s...");
-    delay(30000);
-    ESP.restart();
+  // Read sensor (up to 5 attempts)
+  float temp_f = NAN, temp_c = NAN, humidity = NAN;
+  for (int i = 0; i < 5 && (isnan(temp_f) || isnan(humidity)); i++) {
+    temp_c   = dht.readTemperature();
+    temp_f   = dht.readTemperature(true);
+    humidity = dht.readHumidity();
+    if (isnan(temp_f)) delay(2000);
   }
 
-  // Send first heartbeat immediately on boot
-  sendHeartbeat();
-}
-
-void loop() {
-  if (!connectWifi()) {
-    delay(10000);
+  if (isnan(temp_f) || isnan(humidity)) {
+    Serial.println("Sensor read failed — sleeping until next cycle");
+    blink(5, 80);
+    goToSleep();
     return;
   }
 
-  delay(INTERVAL_MS);
-  sendHeartbeat();
+  if (!connectWifi()) {
+    Serial.println("WiFi failed — sleeping until next cycle");
+    blink(10, 80);
+    goToSleep();
+    return;
+  }
+
+  sendHeartbeat(temp_f, temp_c, humidity);
+  goToSleep();
+}
+
+void loop() {
+  // Never runs — deep sleep re-enters setup() on each wake
 }

@@ -10,7 +10,7 @@
 
 // Unique name for this sensor's location.
 // Examples: "basement", "main_floor", "upstairs", "office"
-#define LOCATION       "basement: matthew"
+#define LOCATION       "basement: gracie"
 
 // Your Mac's local IP address and hub port.
 // Find your Mac's IP: System Settings → Wi-Fi → Details
@@ -18,7 +18,7 @@
 #define HUB_URL        "http://10.0.0.140:5001/sensor"
 
 // How often to send a reading (milliseconds). 300000 = 5 minutes.
-#define INTERVAL_MS    30000
+#define INTERVAL_MS    300000
 
 // GPIO pin the DHT11 DATA wire is connected to
 #define DHT_PIN        2
