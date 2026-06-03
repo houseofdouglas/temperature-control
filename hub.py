@@ -55,7 +55,12 @@ sensor_lock = threading.Lock()
 # ── Fan event log ─────────────────────────────────────────────
 # [{ ts_ms, state: "ON"|"OFF" }, ...]  — only state-change events
 fan_events: deque = deque(maxlen=500)
-_last_fan_state: str = "OFF"   # track last state so we only log changes
+_last_fan_state: str = "OFF"
+
+# ── HVAC event log ────────────────────────────────────────────
+# [{ ts_ms, state: "COOLING"|"HEATING"|"OFF" }, ...]
+hvac_events: deque = deque(maxlen=500)
+_last_hvac_state: str = "OFF"
 
 # ── Database ──────────────────────────────────────────────────
 DB_PATH = os.getenv("DB_PATH", "nest.db")
@@ -85,6 +90,13 @@ def db_init():
                 state TEXT    NOT NULL
             );
             CREATE INDEX IF NOT EXISTS idx_fan_ts ON fan_events(ts);
+
+            CREATE TABLE IF NOT EXISTS hvac_events (
+                id    INTEGER PRIMARY KEY AUTOINCREMENT,
+                ts    REAL    NOT NULL,
+                state TEXT    NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS idx_hvac_ts ON hvac_events(ts);
         """)
     log.info("Database ready: %s", DB_PATH)
 
@@ -105,6 +117,14 @@ def db_write_fan_event(ts_ms, state):
                          (ts_ms, state))
     except Exception as e:
         log.error("DB write fan event error: %s", e)
+
+def db_write_hvac_event(ts_ms, state):
+    try:
+        with db_connect() as conn:
+            conn.execute("INSERT INTO hvac_events (ts, state) VALUES (?,?)",
+                         (ts_ms, state))
+    except Exception as e:
+        log.error("DB write hvac event error: %s", e)
 
 def db_load_history():
     """Preload recent sensor readings and fan events into in-memory stores on startup."""
@@ -131,7 +151,15 @@ def db_load_history():
         for e in evts:
             fan_events.append({"ts": e["ts"], "state": e["state"]})
 
-    log.info("Loaded %d sensor rows and %d fan events from DB", len(rows), len(evts))
+        hvac_evts = conn.execute(
+            "SELECT ts, state FROM hvac_events WHERE ts >= ? ORDER BY ts ASC",
+            (cutoff * 1000,)
+        ).fetchall()
+        for e in hvac_evts:
+            hvac_events.append({"ts": e["ts"], "state": e["state"]})
+
+    log.info("Loaded %d sensor rows, %d fan events, %d hvac events from DB",
+             len(rows), len(evts), len(hvac_evts))
 
 # ── Flask app (receives heartbeats) ───────────────────────────
 app = Flask(__name__)
@@ -212,6 +240,11 @@ def api_history():
 @app.route("/api/fan_events", methods=["GET"])
 def api_fan_events():
     return jsonify(list(fan_events))
+
+
+@app.route("/api/hvac_events", methods=["GET"])
+def api_hvac_events():
+    return jsonify(list(hvac_events))
 
 
 @app.route("/status", methods=["GET"])
@@ -302,30 +335,46 @@ def status():
       return colorByLocation[loc];
     }
 
-    // ── Fan overlay helpers ───────────────────────────────────
-    let fanEventsCache = [];   // [{ts, state}] sorted by time
+    // ── Overlay helpers ───────────────────────────────────────
+    let fanEventsCache  = [];
+    let hvacEventsCache = [];
 
-    function buildAnnotations() {
+    const OVERLAY = {
+      fan:     { color: 'rgba(26,115,232,0.12)',  activeKey: 'ON' },
+      COOLING: { color: 'rgba(255,152,0,0.15)'              },
+      HEATING: { color: 'rgba(244,67,54,0.13)'              },
+    };
+
+    function buildBands(events, prefix, activeStates) {
       const boxes = {};
-      let onTs = null;
-      fanEventsCache.forEach(e => {
-        if (e.state === 'ON'  && onTs === null) { onTs = e.ts; }   // OFF→ON only
-        if (e.state === 'OFF' && onTs !== null) {
-          boxes['fan_' + onTs] = { type: 'box', xMin: onTs, xMax: e.ts,
-            backgroundColor: 'rgba(26,115,232,0.12)', borderWidth: 0 };
-          onTs = null;
+      let onTs = null, onState = null;
+      events.forEach(e => {
+        const active = activeStates.includes(e.state);
+        if (active && onTs === null) { onTs = e.ts; onState = e.state; }
+        if (!active && onTs !== null) {
+          const color = prefix === 'fan'
+            ? OVERLAY.fan.color
+            : (OVERLAY[onState]?.color ?? 'rgba(0,0,0,0.08)');
+          boxes[prefix + '_' + onTs] = { type: 'box', xMin: onTs, xMax: e.ts,
+            backgroundColor: color, borderWidth: 0 };
+          onTs = null; onState = null;
         }
       });
-      // Fan still running — shade up to now
       if (onTs !== null) {
-        boxes['fan_open'] = { type: 'box', xMin: onTs, xMax: Date.now(),
-          backgroundColor: 'rgba(26,115,232,0.12)', borderWidth: 0 };
+        const color = prefix === 'fan'
+          ? OVERLAY.fan.color
+          : (OVERLAY[onState]?.color ?? 'rgba(0,0,0,0.08)');
+        boxes[prefix + '_open'] = { type: 'box', xMin: onTs, xMax: Date.now(),
+          backgroundColor: color, borderWidth: 0 };
       }
       return boxes;
     }
 
     function refreshAnnotations() {
-      const boxes = buildAnnotations();
+      const boxes = {
+        ...buildBands(fanEventsCache,  'fan',  ['ON']),
+        ...buildBands(hvacEventsCache, 'hvac', ['COOLING', 'HEATING']),
+      };
       [chartTemp, chartHumidity].forEach(c => {
         c.options.plugins.annotation.annotations = boxes;
         c.update('none');
@@ -335,6 +384,13 @@ def status():
     function loadFanEvents() {
       fetch('/api/fan_events').then(r => r.json()).then(evts => {
         fanEventsCache = evts;
+        refreshAnnotations();
+      });
+    }
+
+    function loadHvacEvents() {
+      fetch('/api/hvac_events').then(r => r.json()).then(evts => {
+        hvacEventsCache = evts;
         refreshAnnotations();
       });
     }
@@ -483,12 +539,17 @@ def status():
     fetch('/api/status').then(r => r.json()).then(render);
     loadHistory();
     loadFanEvents();
+    loadHvacEvents();
 
     // Live updates via WebSocket — no polling needed
     const socket = io();
     socket.on('sensor_update', onSensorUpdate);
     socket.on('fan_event', evt => {
       fanEventsCache.push(evt);
+      refreshAnnotations();
+    });
+    socket.on('hvac_event', evt => {
+      hvacEventsCache.push(evt);
       refreshAnnotations();
     });
     socket.on('history_point', ({ location, point }) => {
@@ -504,7 +565,7 @@ def status():
         chartHumidity.update('none');
       }
     });
-    socket.on('connect',    () => { document.getElementById('updated').textContent = 'Connected ✓'; loadHistory(); loadFanEvents(); });
+    socket.on('connect',    () => { document.getElementById('updated').textContent = 'Connected ✓'; loadHistory(); loadFanEvents(); loadHvacEvents(); });
     socket.on('disconnect', () => document.getElementById('updated').textContent = 'Disconnected — reconnecting...');
   </script>
 </body>
@@ -659,10 +720,22 @@ def evaluate_and_act():
                 "temp_f":   temp_f,
                 "humidity": humidity,
             })
-        log.info("❶ Nest         %-15s  %.1f°F  %s%% RH  fan=%s",
-                 location, temp_f, humidity or "?", fan_mode(thermostat))
+        hvac_status = traits.get("sdm.devices.traits.ThermostatHvac", {}).get("status", "OFF")
+        log.info("❶ Nest         %-15s  %.1f°F  %s%% RH  fan=%s  hvac=%s",
+                 location, temp_f, humidity or "?", fan_mode(thermostat), hvac_status)
         threading.Thread(target=db_write_reading, daemon=True,
                          args=(ts, location, temp_f, round(temp_c, 1), humidity)).start()
+
+        # Track HVAC state changes
+        global _last_hvac_state
+        if hvac_status != _last_hvac_state:
+            _last_hvac_state = hvac_status
+            hvac_event = {"ts": ts * 1000, "state": hvac_status}
+            hvac_events.append(hvac_event)
+            socketio.emit("hvac_event", hvac_event)
+            threading.Thread(target=db_write_hvac_event, daemon=True,
+                             args=(ts * 1000, hvac_status)).start()
+
         socketio.emit("sensor_update", _dashboard_payload())
         socketio.emit("history_point", {
             "location": location,
