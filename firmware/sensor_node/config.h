@@ -15,7 +15,7 @@
 // Your Mac's local IP address and hub port.
 // Find your Mac's IP: System Settings → Wi-Fi → Details
 // Or run in Terminal:  ipconfig getifaddr en0
-#define HUB_URL        "http://10.0.0.140:5001/sensor"
+#define HUB_URL        "http://10.0.0.216:5001/sensor"
 
 // How often to send a reading (milliseconds). 300000 = 5 minutes.
 #define INTERVAL_MS    300000
