@@ -737,10 +737,6 @@ def evaluate_and_act():
 
     log.info("Δ %.1f°F  |  %s=%.1f°F (hot)  %s=%.1f°F (cold)  |  threshold=%.1f°F",
              delta, hot_loc, max_temp, cold_loc, min_temp, TEMP_DELTA_THRESHOLD_F)
-        socketio.emit("history_point", {
-            "location": location,
-            "point":    {"ts": ts * 1000, "temp_f": temp_f, "humidity": humidity},
-        })
 
     current_mode = fan_mode(thermostat)
     device_name  = thermostat["name"]
