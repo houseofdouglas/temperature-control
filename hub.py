@@ -669,34 +669,13 @@ def fan_control_loop():
 def evaluate_and_act():
     now = time.time()
 
-    with sensor_lock:
-        fresh = {
-            loc: d for loc, d in sensor_data.items()
-            if now - d["received_at"] <= SENSOR_STALE_SECONDS
-        }
-
-    if len(fresh) < 2:
-        log.warning("Only %d fresh sensor(s) — need ≥2 to compute delta. "
-                    "Waiting for more heartbeats.", len(fresh))
-        return
-
-    temps = {loc: d["temp_f"] for loc, d in fresh.items()}
-    max_temp = max(temps.values())
-    min_temp = min(temps.values())
-    delta = max_temp - min_temp
-    hot_loc = max(temps, key=temps.get)
-    cold_loc = min(temps, key=temps.get)
-
-    log.info("Δ %.1f°F  |  %s=%.1f°F (hot)  %s=%.1f°F (cold)  |  threshold=%.1f°F",
-             delta, hot_loc, max_temp, cold_loc, min_temp, TEMP_DELTA_THRESHOLD_F)
-
+    # ── Poll Nest first so it's always in sensor_data ─────────
     token      = get_access_token()
     thermostat = find_thermostat(token)
     if thermostat is None:
         log.error("No thermostat found via SDM API.")
         return
 
-    # ── Inject thermostat temperature into the sensor store ──
     traits   = thermostat.get("traits", {})
     temp_c   = traits.get("sdm.devices.traits.Temperature", {}).get("ambientTemperatureCelsius")
     humidity = traits.get("sdm.devices.traits.Humidity",    {}).get("ambientHumidityPercent")
@@ -726,7 +705,6 @@ def evaluate_and_act():
         threading.Thread(target=db_write_reading, daemon=True,
                          args=(ts, location, temp_f, round(temp_c, 1), humidity)).start()
 
-        # Track HVAC state changes
         global _last_hvac_state
         if hvac_status != _last_hvac_state:
             _last_hvac_state = hvac_status
@@ -737,6 +715,28 @@ def evaluate_and_act():
                              args=(ts * 1000, hvac_status)).start()
 
         socketio.emit("sensor_update", _dashboard_payload())
+
+    # ── Now check delta across all fresh sensors ───────────────
+    with sensor_lock:
+        fresh = {
+            loc: d for loc, d in sensor_data.items()
+            if now - d["received_at"] <= SENSOR_STALE_SECONDS
+        }
+
+    if len(fresh) < 2:
+        log.warning("Only %d fresh sensor(s) — need ≥2 to compute delta. "
+                    "Waiting for more heartbeats.", len(fresh))
+        return
+
+    temps = {loc: d["temp_f"] for loc, d in fresh.items()}
+    max_temp = max(temps.values())
+    min_temp = min(temps.values())
+    delta = max_temp - min_temp
+    hot_loc = max(temps, key=temps.get)
+    cold_loc = min(temps, key=temps.get)
+
+    log.info("Δ %.1f°F  |  %s=%.1f°F (hot)  %s=%.1f°F (cold)  |  threshold=%.1f°F",
+             delta, hot_loc, max_temp, cold_loc, min_temp, TEMP_DELTA_THRESHOLD_F)
         socketio.emit("history_point", {
             "location": location,
             "point":    {"ts": ts * 1000, "temp_f": temp_f, "humidity": humidity},
