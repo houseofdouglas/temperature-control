@@ -10,11 +10,13 @@ Run with:  .venv/bin/python hub.py
 
 import os
 import time
+import random
+import hashlib
 import logging
 import sqlite3
 import threading
 from collections import deque
-from datetime import datetime
+from datetime import datetime, date
 from flask import Flask, request, jsonify
 from flask_socketio import SocketIO
 import requests as req
@@ -33,8 +35,44 @@ TEMP_DELTA_THRESHOLD_F = float(os.getenv("TEMP_DELTA_THRESHOLD_F", "3.0"))
 FAN_RUN_DURATION_SECONDS = int(os.getenv("FAN_RUN_DURATION_SECONDS", "1200"))
 SENSOR_STALE_SECONDS  = int(os.getenv("SENSOR_STALE_SECONDS",  "600"))   # ignore readings >10 min old
 CHECK_INTERVAL_SECONDS = int(os.getenv("CHECK_INTERVAL_SECONDS", "120"))  # evaluate fan every 2 min
-FAN_QUIET_START       = os.getenv("FAN_QUIET_START", "22:00")   # fan off after this time
-FAN_QUIET_END         = os.getenv("FAN_QUIET_END",   "06:30")   # fan back on after this time
+# Quiet hours. Set both to the same value (or blank) to disable entirely.
+# Disabled as of 2026-08-12: the evening/overnight window is when the compressor
+# works hardest (77-91% duty, 18:00-24:00) *and* when the basement reservoir is
+# deepest (11-12°F) — suppressing the fan there was blocking the highest-value
+# cooling hours of the day.
+FAN_QUIET_START       = os.getenv("FAN_QUIET_START", "")
+FAN_QUIET_END         = os.getenv("FAN_QUIET_END",   "")
+
+# ── Comfort-based control ─────────────────────────────────────
+# Objective (from 2026-08-12): keep the occupied upstairs rooms below
+# COMFORT_MAX_F using basement air, so the compressor runs less — replacing the
+# older "narrow the floor-to-floor band" goal, which no longer matches the
+# sensor layout (3 upstairs, 1 basement, 1 main floor).
+#
+# Two conditions must BOTH hold before the fan is worth running:
+#   1. the occupied rooms are at/near the comfort ceiling, and
+#   2. the basement is actually cold enough to be worth moving air from.
+# Condition 2 is new — circulating air when the gradient has collapsed just
+# runs the blower for nothing.
+COMFORT_MAX_F        = float(os.getenv("COMFORT_MAX_F",      "74.0"))
+COMFORT_DEADBAND_F   = float(os.getenv("COMFORT_DEADBAND_F", "1.5"))
+MIN_GRADIENT_F       = float(os.getenv("MIN_GRADIENT_F",     "3.0"))
+OCCUPIED_PREFIX      = os.getenv("OCCUPIED_PREFIX",  "upstairs")
+RESERVOIR_PREFIX     = os.getenv("RESERVOIR_PREFIX", "basement")
+
+# ── Experiment: rotate daily through fan-control strategies ──
+# Phase 2 (from 2026-06-27): duty_cycle (15 on / 15 off) is now the
+# production default — the fallback for any unrecognized arm and what runs
+# when EXPERIMENT_ENABLED=false.  The rotation tests two alternatives against
+# that new baseline: burst (morning-only window) and higher_threshold (runs
+# the duty-cycle pattern only when Δ > EXPERIMENT_HIGH_THRESHOLD_F).
+EXPERIMENT_ENABLED          = os.getenv("EXPERIMENT_ENABLED", "true").lower() == "true"
+EXPERIMENT_SEED_SALT        = os.getenv("EXPERIMENT_SEED_SALT", "nest-fan-arms-v2")
+EXPERIMENT_ARMS             = ["burst", "higher_threshold"]
+EXPERIMENT_HIGH_THRESHOLD_F = float(os.getenv("EXPERIMENT_HIGH_THRESHOLD_F", "9.0"))
+EXPERIMENT_BURST_MINUTES    = int(os.getenv("EXPERIMENT_BURST_MINUTES",     "120"))
+EXPERIMENT_DUTY_ON_MINUTES  = int(os.getenv("EXPERIMENT_DUTY_ON_MINUTES",   "15"))
+EXPERIMENT_DUTY_OFF_MINUTES = int(os.getenv("EXPERIMENT_DUTY_OFF_MINUTES",  "15"))
 
 # ── Logging ───────────────────────────────────────────────────
 logging.basicConfig(
@@ -45,12 +83,26 @@ logging.basicConfig(
 log = logging.getLogger(__name__)
 
 # ── Sensor store ──────────────────────────────────────────────
+# Keyed by *resolved* location (see device remapping below), not by whatever
+# the firmware happens to report.
 # { location: { temp_f, humidity, received_at } }
 sensor_data: dict = {}
 # { location: deque([{ts, temp_f, humidity}, ...]) }
 sensor_history: dict = {}
 HISTORY_MAX = 1000  # keep last 1000 readings per sensor (~3.5 days at 5 min)
 sensor_lock = threading.Lock()
+
+# ── Device → location remapping ───────────────────────────────
+# Sensors are physically moved between rooms, and reflashing a board just to
+# rename it is a pain. So the string a board reports is treated as its
+# immutable *device id* (a serial number that happens to look like a room),
+# and the hub owns the mapping from device id → the room it's actually in.
+# Rename from the dashboard or POST /api/devices/<id>/location; no reflash.
+#
+# Unmapped devices fall through to their device id, so a brand-new board that
+# has never been renamed behaves exactly as it always did.
+# { device_id: location }
+device_locations: dict = {}
 
 # ── Fan event log ─────────────────────────────────────────────
 # [{ ts_ms, state: "ON"|"OFF" }, ...]  — only state-change events
@@ -61,6 +113,18 @@ _last_fan_state: str = "OFF"
 # [{ ts_ms, state: "COOLING"|"HEATING"|"OFF" }, ...]
 hvac_events: deque = deque(maxlen=500)
 _last_hvac_state: str = "OFF"
+
+# ── Thermostat target ─────────────────────────────────────────
+# The setpoint moves both on a schedule and by hand, so it's a confounder for
+# any "did the fan displace AC?" comparison — a colder target explains more
+# compressor time on its own. Tracked as change-events, same as fan/hvac.
+# [{ ts_ms, cool_f, prev_cool_f, mode }, ...]
+setpoint_events: deque = deque(maxlen=500)
+_thermostat_state: dict | None = None
+
+# ── Experiment-arm tracking ───────────────────────────────────
+_experiment_dates_logged: set = set()   # date.isoformat() strings already written to DB
+_last_logged_arm: str | None = None     # avoid re-logging "active arm" every poll cycle
 
 # ── Database ──────────────────────────────────────────────────
 DB_PATH = os.getenv("DB_PATH", "nest.db")
@@ -97,6 +161,34 @@ def db_init():
                 state TEXT    NOT NULL
             );
             CREATE INDEX IF NOT EXISTS idx_hvac_ts ON hvac_events(ts);
+
+            -- What the thermostat was actually targeting at each poll. Without
+            -- this, AC-runtime comparisons are meaningless: the setpoint moves
+            -- on a schedule (observed 70.0°F at 07:30, 73.6°F at 08:00), so a
+            -- day with more compressor time may simply have had a colder target.
+            CREATE TABLE IF NOT EXISTS thermostat_state (
+                ts          REAL NOT NULL,
+                mode        TEXT,
+                cool_f      REAL,
+                heat_f      REAL,
+                hvac_status TEXT,
+                eco         TEXT
+            );
+            CREATE INDEX IF NOT EXISTS idx_thermostat_ts ON thermostat_state(ts);
+
+            CREATE TABLE IF NOT EXISTS device_locations (
+                device_id  TEXT PRIMARY KEY,
+                location   TEXT NOT NULL,
+                updated_at REAL NOT NULL
+            );
+
+            CREATE TABLE IF NOT EXISTS experiment_log (
+                id        INTEGER PRIMARY KEY AUTOINCREMENT,
+                date      TEXT    NOT NULL UNIQUE,
+                arm       TEXT    NOT NULL,
+                logged_at REAL    NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS idx_experiment_date ON experiment_log(date);
         """)
     log.info("Database ready: %s", DB_PATH)
 
@@ -125,6 +217,70 @@ def db_write_hvac_event(ts_ms, state):
                          (ts_ms, state))
     except Exception as e:
         log.error("DB write hvac event error: %s", e)
+
+def db_write_experiment_arm(date_str, arm, ts):
+    try:
+        with db_connect() as conn:
+            conn.execute(
+                "INSERT OR IGNORE INTO experiment_log (date, arm, logged_at) VALUES (?,?,?)",
+                (date_str, arm, ts)
+            )
+    except Exception as e:
+        log.error("DB write experiment_log error: %s", e)
+
+def db_load_experiment_log():
+    """Preload which dates already have a logged arm, so a restart mid-day
+    doesn't write a duplicate row (the UNIQUE constraint would just no-op,
+    but this keeps the in-memory set consistent with the DB)."""
+    with db_connect() as conn:
+        rows = conn.execute("SELECT date FROM experiment_log").fetchall()
+    _experiment_dates_logged.update(r["date"] for r in rows)
+    log.info("Loaded %d experiment-log dates from DB", len(rows))
+
+def db_write_thermostat_state(ts, mode, cool_f, heat_f, hvac_status, eco):
+    try:
+        with db_connect() as conn:
+            conn.execute(
+                "INSERT INTO thermostat_state (ts, mode, cool_f, heat_f, hvac_status, eco) "
+                "VALUES (?,?,?,?,?,?)",
+                (ts, mode, cool_f, heat_f, hvac_status, eco)
+            )
+    except Exception as e:
+        log.error("DB write thermostat_state error: %s", e)
+
+def db_write_device_location(device_id, location, ts):
+    try:
+        with db_connect() as conn:
+            conn.execute(
+                "INSERT INTO device_locations (device_id, location, updated_at) VALUES (?,?,?) "
+                "ON CONFLICT(device_id) DO UPDATE SET location=excluded.location, "
+                "updated_at=excluded.updated_at",
+                (device_id, location, ts)
+            )
+    except Exception as e:
+        log.error("DB write device_location error: %s", e)
+
+def db_delete_device_location(device_id):
+    try:
+        with db_connect() as conn:
+            conn.execute("DELETE FROM device_locations WHERE device_id = ?", (device_id,))
+    except Exception as e:
+        log.error("DB delete device_location error: %s", e)
+
+def db_load_device_locations():
+    """Load device→location overrides so renames survive a restart."""
+    with db_connect() as conn:
+        rows = conn.execute("SELECT device_id, location FROM device_locations").fetchall()
+    device_locations.update({r["device_id"]: r["location"] for r in rows})
+    if rows:
+        log.info("Loaded %d device location override(s): %s", len(rows),
+                 ", ".join(f"{r['device_id']} → {r['location']}" for r in rows))
+    else:
+        log.info("No device location overrides (all sensors use their firmware name)")
+
+def resolve_location(device_id: str) -> str:
+    """Map a board's hard-coded id to the room it's actually in right now."""
+    return device_locations.get(device_id, device_id)
 
 def db_load_history():
     """Preload recent sensor readings and fan events into in-memory stores on startup."""
@@ -172,7 +328,12 @@ def receive_sensor():
     if not data or "location" not in data or "temp_f" not in data:
         return jsonify({"error": "missing fields"}), 400
 
-    location = data["location"]
+    # Boards identify themselves with their flashed name. Newer firmware may
+    # send an explicit device_id (e.g. MAC); either way the id is immutable
+    # and the hub decides which room it maps to.
+    device_id = data.get("device_id") or data["location"]
+    location  = resolve_location(device_id)
+
     now = time.time()
     with sensor_lock:
         sensor_data[location] = {
@@ -180,6 +341,7 @@ def receive_sensor():
             "temp_c":      data.get("temp_c"),
             "humidity":    data.get("humidity"),
             "received_at": now,
+            "device_id":   device_id,
         }
         if location not in sensor_history:
             sensor_history[location] = deque(maxlen=HISTORY_MAX)
@@ -212,6 +374,8 @@ def _dashboard_payload() -> dict:
         sensors = [
             {
                 "location":    loc,
+                "device_id":   d.get("device_id", loc),
+                "renamed":     d.get("device_id", loc) != loc,
                 "temp_f":      d["temp_f"],
                 "humidity":    d.get("humidity"),
                 "age_seconds": int(now - d["received_at"]),
@@ -220,7 +384,28 @@ def _dashboard_payload() -> dict:
         ]
     temps = [s["temp_f"] for s in sensors]
     delta = round(max(temps) - min(temps), 1) if len(temps) >= 2 else None
-    return {"sensors": sensors, "delta_f": delta, "threshold_f": TEMP_DELTA_THRESHOLD_F}
+
+    arm = arm_for_date(datetime.now().date()) if EXPERIMENT_ENABLED else "duty_cycle"
+
+    with sensor_lock:
+        fresh = {loc: d for loc, d in sensor_data.items()
+                 if now - d["received_at"] <= SENSOR_STALE_SECONDS}
+    comfort = comfort_state(fresh)
+    ts_state = _thermostat_state or {}
+
+    return {
+        "sensors":    sensors,
+        "fan_state":  _last_fan_state,
+        "delta_f":    delta,
+        "threshold_f": TEMP_DELTA_THRESHOLD_F,
+        "experiment": {"enabled": EXPERIMENT_ENABLED, "arm": arm},
+        "comfort":    {**comfort, "cap_f": COMFORT_MAX_F},
+        "thermostat": {
+            "mode":        ts_state.get("mode"),
+            "cool_f":      ts_state.get("cool_f"),
+            "hvac_status": ts_state.get("hvac_status"),
+        },
+    }
 
 
 @app.route("/api/status", methods=["GET"])
@@ -247,6 +432,99 @@ def api_hvac_events():
     return jsonify(list(hvac_events))
 
 
+@app.route("/api/setpoint_events", methods=["GET"])
+def api_setpoint_events():
+    """Every observed change to the thermostat target — schedule or manual."""
+    return jsonify(list(setpoint_events))
+
+
+@app.route("/api/devices", methods=["GET"])
+def api_devices():
+    """Every device the hub has seen live, with its firmware id and the room
+    it's currently mapped to."""
+    now = time.time()
+    with sensor_lock:
+        devices = [
+            {
+                "device_id":   d.get("device_id", loc),
+                "location":    loc,
+                "renamed":     d.get("device_id", loc) != loc,
+                "age_seconds": int(now - d["received_at"]),
+            }
+            for loc, d in sorted(sensor_data.items())
+        ]
+    return jsonify({"devices": devices, "overrides": dict(device_locations)})
+
+
+@app.route("/api/devices/<path:device_id>/location", methods=["POST"])
+def api_set_device_location(device_id):
+    """Point a device at a different room. Send {"location": "upstairs: aria"},
+    or {"location": null} to fall back to the firmware name."""
+    data = request.get_json(silent=True) or {}
+    if "location" not in data:
+        return jsonify({"error": "missing 'location'"}), 400
+
+    new_location = data["location"]
+    if new_location is not None:
+        if not isinstance(new_location, str) or not new_location.strip():
+            return jsonify({"error": "'location' must be a non-empty string or null"}), 400
+        new_location = new_location.strip()
+
+    old_location = resolve_location(device_id)
+
+    # Reject a name another *different* device is already reporting under —
+    # two sensors sharing a key would silently overwrite each other.
+    target = new_location if new_location is not None else device_id
+    with sensor_lock:
+        clash = sensor_data.get(target)
+        if clash is not None and clash.get("device_id", target) != device_id:
+            return jsonify({
+                "error": f"'{target}' is already in use by device "
+                         f"'{clash.get('device_id', target)}'"
+            }), 409
+
+    if new_location is None:
+        device_locations.pop(device_id, None)
+        threading.Thread(target=db_delete_device_location, daemon=True,
+                         args=(device_id,)).start()
+    else:
+        device_locations[device_id] = new_location
+        threading.Thread(target=db_write_device_location, daemon=True,
+                         args=(device_id, new_location, time.time())).start()
+
+    resolved = resolve_location(device_id)
+
+    # Drop the live entry under the old name so the moved sensor doesn't linger
+    # in the table as a ghost that slowly goes stale. History is deliberately
+    # left alone: those readings really were taken in the old room, and
+    # relabelling them would corrupt the record the analysis scripts read.
+    if resolved != old_location:
+        with sensor_lock:
+            sensor_data.pop(old_location, None)
+        log.info("📍 Device '%s' moved: %s → %s", device_id, old_location, resolved)
+
+    socketio.emit("sensor_update", _dashboard_payload())
+    return jsonify({"ok": True, "device_id": device_id, "location": resolved})
+
+
+@app.route("/api/experiment", methods=["GET"])
+def api_experiment():
+    """Today's active arm plus the recent assignment history (for later
+    analysis — e.g. grouping fan/temperature data by arm)."""
+    today = datetime.now().date()
+    arm_today = arm_for_date(today) if EXPERIMENT_ENABLED else "duty_cycle"
+    with db_connect() as conn:
+        rows = conn.execute(
+            "SELECT date, arm, logged_at FROM experiment_log ORDER BY date DESC LIMIT 30"
+        ).fetchall()
+    return jsonify({
+        "enabled": EXPERIMENT_ENABLED,
+        "arms":    EXPERIMENT_ARMS,
+        "today":   {"date": today.isoformat(), "arm": arm_today},
+        "history": [{"date": r["date"], "arm": r["arm"], "logged_at": r["logged_at"]} for r in rows],
+    })
+
+
 @app.route("/status", methods=["GET"])
 def status():
     """Live dashboard — auto-updates every 10 s without a full page reload."""
@@ -270,8 +548,15 @@ def status():
     tr:last-child td { border-bottom: none; }
     .stale { color: #e53935; }
     .ok    { color: #43a047; }
+    .rename { margin-left: 8px; font-size: .7rem; padding: 2px 8px; border-radius: 10px;
+              border: 1px solid #ddd; background: #fafafa; color: #888; cursor: pointer; opacity: 0; transition: opacity .12s; }
+    tr:hover .rename { opacity: 1; }
+    .rename:hover { background: #1a73e8; border-color: #1a73e8; color: #fff; }
+    .devid { font-size: .7rem; color: #bbb; margin-top: 2px; }
     .delta { margin-top: 16px; padding: 12px 16px; background: #fff; border-radius: 8px; box-shadow: 0 1px 4px rgba(0,0,0,.1); font-size: .95rem; }
     .delta span { font-weight: 600; }
+    .experiment { margin-top: 10px; padding: 10px 16px; background: #fff8e1; border: 1px solid #ffe082; border-radius: 8px; box-shadow: 0 1px 4px rgba(0,0,0,.06); font-size: .85rem; color: #6d4c00; }
+    .experiment .arm { font-weight: 700; text-transform: uppercase; letter-spacing: .03em; padding: 2px 8px; background: #ffe082; border-radius: 12px; margin-left: 4px; }
     #updated { color: #aaa; font-size: .78rem; margin-top: 12px; }
     .chart-wrap { background: #fff; border-radius: 8px; padding: 16px; box-shadow: 0 1px 4px rgba(0,0,0,.1); margin-bottom: 16px; }
     .chart-label { font-size: .8rem; font-weight: 600; color: #666; text-transform: uppercase; letter-spacing: .05em; margin: 0 0 6px 4px; }
@@ -292,6 +577,7 @@ def status():
       <tbody id="rows"><tr><td colspan="4" style="color:#aaa">Waiting for sensors...</td></tr></tbody>
     </table>
     <div class="delta" id="delta"></div>
+    <div class="experiment" id="experiment" style="display:none"></div>
   </div>
 
   <div id="view-graph" class="view">
@@ -436,9 +722,10 @@ def status():
     function resetZoom() {
       const now = Date.now();
       [chartTemp, chartHumidity].forEach(c => {
+        c.resetZoom();                       // clears the plugin's stored pan/zoom state
         c.options.scales.x.min = now - WINDOW_12H;
-        c.options.scales.x.max = undefined;
-        c.resetZoom();
+        c.options.scales.x.max = now;
+        c.update('none');                    // re-render without animation; no plugin state to override
       });
     }
 
@@ -490,6 +777,37 @@ def status():
       });
     }
 
+    function esc(s) {
+      return String(s).replace(/[&<>"']/g, c => (
+        {'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]
+      ));
+    }
+
+    async function renameDevice(deviceId, current) {
+      const next = prompt(
+        `Which room is this sensor in now?\n\n` +
+        `Device (flashed name): ${deviceId}\n` +
+        `Leave blank to reset it back to the flashed name.`,
+        current);
+      if (next === null) return;                       // cancelled
+
+      const body = { location: next.trim() === '' ? null : next.trim() };
+      const res  = await fetch(`/api/devices/${encodeURIComponent(deviceId)}/location`, {
+        method:  'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body:    JSON.stringify(body),
+      });
+      if (!res.ok) {
+        const err = await res.json().catch(() => ({}));
+        alert('Could not rename: ' + (err.error || res.status));
+        return;
+      }
+      // Old series keeps its history on the chart; the new name starts fresh.
+      delete seenAt[current];
+      const status = await fetch('/api/status').then(r => r.json());
+      render(status);
+    }
+
     function render(d) {
       const now   = Date.now();
       const tbody = document.getElementById('rows');
@@ -503,23 +821,47 @@ def status():
           if (!seenAt[s.location]) seenAt[s.location] = now - s.age_seconds * 1000;
           const ms    = now - seenAt[s.location];
           const stale = ms > 600000;
+          const sub = s.renamed
+            ? `<div class="devid">device: ${esc(s.device_id)}</div>` : '';
           return `<tr>
-            <td>${s.location}</td>
+            <td>
+              <span>${esc(s.location)}</span>
+              <button class="rename" title="Move this sensor to another room"
+                      onclick="renameDevice(${JSON.stringify(s.device_id).replace(/"/g, '&quot;')},
+                                            ${JSON.stringify(s.location).replace(/"/g, '&quot;')})">rename</button>
+              ${sub}
+            </td>
             <td>${s.temp_f.toFixed(1)} °F</td>
             <td>${s.humidity ?? '—'} %</td>
-            <td class="${stale ? 'stale' : 'ok'}" data-location="${s.location}">${fmtAge(ms)}</td>
+            <td class="${stale ? 'stale' : 'ok'}" data-location="${esc(s.location)}">${fmtAge(ms)}</td>
           </tr>`;
         }).join('');
       }
 
       const deltaEl = document.getElementById('delta');
       if (d.delta_f !== null) {
-        const over = d.delta_f > d.threshold_f;
+        const running = d.fan_state === 'ON';
         deltaEl.innerHTML = `Floor delta: <span>${d.delta_f.toFixed(1)} °F</span> &nbsp;|&nbsp; `
           + `Threshold: ${d.threshold_f} °F &nbsp;|&nbsp; `
-          + `Fan: <span class="${over ? 'stale' : 'ok'}">${over ? 'RUNNING' : 'OFF'}</span>`;
+          + `Fan: <span class="${running ? 'stale' : 'ok'}">${running ? 'RUNNING' : 'OFF'}</span>`;
       } else {
         deltaEl.innerHTML = 'Waiting for 2+ sensors to compute delta...';
+      }
+
+      const expEl = document.getElementById('experiment');
+      if (d.experiment && d.experiment.enabled) {
+        const names = {
+          control:          'Control (today’s logic)',
+          higher_threshold: 'Higher threshold',
+          burst:            'Morning burst',
+          duty_cycle:       'Duty cycle',
+        };
+        const arm = d.experiment.arm;
+        expEl.style.display = '';
+        expEl.innerHTML = `🧪 Today's experiment arm: <span class="arm">${names[arm] || arm}</span>`
+          + ` &nbsp;<span style="color:#9b7b00">(rotates daily — see /api/experiment)</span>`;
+      } else {
+        expEl.style.display = 'none';
       }
 
       document.getElementById('updated').textContent = 'Updated ' + new Date().toLocaleTimeString();
@@ -644,15 +986,219 @@ def _parse_hhmm(s: str):
     h, m = map(int, s.split(":"))
     return h * 60 + m
 
-def in_quiet_hours() -> bool:
-    from datetime import datetime
-    now  = datetime.now()
+def quiet_hours_enabled() -> bool:
+    return bool(FAN_QUIET_START.strip() and FAN_QUIET_END.strip()
+                and FAN_QUIET_START.strip() != FAN_QUIET_END.strip())
+
+def in_quiet_hours(now_dt: datetime | None = None) -> bool:
+    if not quiet_hours_enabled():
+        return False
+    now  = now_dt or datetime.now()
     mins = now.hour * 60 + now.minute
     start = _parse_hhmm(FAN_QUIET_START)
     end   = _parse_hhmm(FAN_QUIET_END)
     if start > end:          # spans midnight (e.g. 22:00 → 06:30)
         return mins >= start or mins < end
     return start <= mins < end
+
+
+# ── Experiment: randomized daily treatment arms ───────────────
+# Goal: find out whether any alternative fan strategy beats what's running
+# today ("control" = the exact `delta > threshold` logic above), without ever
+# being riskier than today. Design notes:
+#
+#   • One arm is active for an entire calendar day — long enough for the
+#     thermal system (which has hours of lag) to actually respond to it,
+#     and short enough that ~3 weeks gives each arm a good sample of
+#     different weather/seasonal conditions.
+#   • Arms are assigned via a *randomized complete block* schedule: every
+#     run of len(EXPERIMENT_ARMS) consecutive days is a "block" containing
+#     each arm exactly once, in an order shuffled by a date-derived seed.
+#     This avoids both (a) pure-random streaks (e.g. "control" 5 days running
+#     by bad luck) and (b) a fixed rotation that could alias with a weekly
+#     weather pattern — while staying perfectly deterministic, so a hub
+#     restart mid-day always recomputes the *same* arm for that date.
+#   • "control" is always in the rotation and is also the fallback for any
+#     unrecognized arm name — so the worst case is identical to today.
+_EXPERIMENT_EPOCH = date(2026, 1, 1)
+
+def arm_for_date(d: date) -> str:
+    """Deterministically pick today's experiment arm via a seeded shuffle
+    of a balanced block — see design notes above."""
+    block_len = len(EXPERIMENT_ARMS)
+    day_index = (d - _EXPERIMENT_EPOCH).days
+    block_index, position = divmod(day_index, block_len)
+    seed = hashlib.sha256(f"{EXPERIMENT_SEED_SALT}:{block_index}".encode()).digest()
+    shuffled = EXPERIMENT_ARMS[:]
+    random.Random(seed).shuffle(shuffled)
+    return shuffled[position]
+
+
+def _minutes_since_quiet_hours_end(now_dt: datetime):
+    """Minutes elapsed since quiet hours last ended, or None if we're
+    currently inside quiet hours (caller already gates on that, but this
+    stays safe to call standalone). With quiet hours disabled the "burst"
+    arm still needs a morning anchor, so fall back to the old 06:30 end."""
+    if in_quiet_hours(now_dt):
+        return None
+    end_mins = _parse_hhmm(FAN_QUIET_END) if quiet_hours_enabled() else _parse_hhmm("06:30")
+    now_mins = now_dt.hour * 60 + now_dt.minute + now_dt.second / 60
+    elapsed = now_mins - end_mins
+    if elapsed < 0:          # we're past midnight, before quiet hours starts again
+        elapsed += 24 * 60
+    return elapsed
+
+
+def _duty_cycle_on_phase(now_dt: datetime, on_minutes: int, off_minutes: int) -> bool:
+    """A repeating on/off window anchored to midnight, so the phase is
+    stable across restarts (no drift, no need to persist phase state)."""
+    cycle = on_minutes + off_minutes
+    mins = now_dt.hour * 60 + now_dt.minute + now_dt.second / 60
+    return (mins % cycle) < on_minutes
+
+
+def _set_thermostat_snapshot(mode, cool_f, heat_f, hvac_status, eco):
+    """Track what the thermostat is targeting.
+
+    The setpoint is changed by hand as well as on a schedule, so it moves
+    unpredictably. Every change is written as its own timestamped row (the same
+    write-on-change pattern as fan/hvac events) — that keeps the table small and
+    makes "what was the target at time T" a simple as-of lookup, while a manual
+    nudge shows up as an explicit event rather than being smeared across
+    two-minute samples.
+    """
+    global _thermostat_state
+    snapshot = {"mode": mode, "cool_f": cool_f, "heat_f": heat_f,
+                "hvac_status": hvac_status, "eco": eco}
+
+    prev = _thermostat_state
+    # hvac_status flips constantly as the compressor cycles; it already has its
+    # own event log, so don't let it trigger a setpoint row.
+    watched = ("mode", "cool_f", "heat_f", "eco")
+    changed = prev is None or any(prev.get(k) != snapshot[k] for k in watched)
+
+    _thermostat_state = {**snapshot, "updated_at": time.time()}
+    if not changed:
+        return
+
+    if prev is not None and prev.get("cool_f") != cool_f:
+        log.info("🎯 Cool setpoint changed: %s°F → %s°F",
+                 prev.get("cool_f"), cool_f)
+        event = {"ts": time.time() * 1000, "cool_f": cool_f,
+                 "prev_cool_f": prev.get("cool_f"), "mode": mode}
+        setpoint_events.append(event)
+        socketio.emit("setpoint_event", event)
+    elif prev is not None:
+        log.info("🎯 Thermostat changed: mode=%s eco=%s cool=%s°F", mode, eco, cool_f)
+
+    threading.Thread(target=db_write_thermostat_state, daemon=True,
+                     args=(time.time(), mode, cool_f, heat_f, hvac_status, eco)).start()
+
+
+def comfort_state(fresh: dict) -> dict:
+    """Summarise the house against the comfort objective.
+
+    occupied  — hottest occupied upstairs room (what we're trying to hold down)
+    reservoir — coldest basement sensor (the free cooling we can draw on)
+    gradient  — how much usable cooling sits below the occupied rooms
+
+    Returns why=None when it can't be evaluated (e.g. no upstairs sensor
+    reporting), so callers can fall back rather than act on a guess.
+    """
+    occ = {loc: d["temp_f"] for loc, d in fresh.items()
+           if loc.startswith(OCCUPIED_PREFIX)}
+    res = {loc: d["temp_f"] for loc, d in fresh.items()
+           if loc.startswith(RESERVOIR_PREFIX)}
+
+    if not occ or not res:
+        missing = "occupied" if not occ else "reservoir"
+        return {"ok": False, "why": f"no {missing} sensor reporting"}
+
+    occ_loc = max(occ, key=occ.get)
+    res_loc = min(res, key=res.get)
+    occupied, reservoir = occ[occ_loc], res[res_loc]
+    gradient = occupied - reservoir
+
+    too_warm     = occupied >= COMFORT_MAX_F - COMFORT_DEADBAND_F
+    worth_moving = gradient >= MIN_GRADIENT_F
+
+    return {
+        "ok":            True,
+        "occupied":      occupied,
+        "occupied_loc":  occ_loc,
+        "reservoir":     reservoir,
+        "reservoir_loc": res_loc,
+        "gradient":      gradient,
+        "too_warm":      too_warm,
+        "worth_moving":  worth_moving,
+        "should_cool":   too_warm and worth_moving,
+        "over_cap":      occupied > COMFORT_MAX_F,
+    }
+
+
+def decide_fan_mode(delta: float, arm: str, now_dt: datetime):
+    """Translate (delta, active arm, time) into a fan decision.
+
+    Returns (desired_mode, threshold_used, run_duration_s, note) where `note`
+    is a short human-readable explanation of *why*, for the logs/dashboard.
+    Every branch still respects the measured delta — none of these arms will
+    run the fan when there's no temperature difference to move around;  they
+    only vary *how readily* / *how long* / *on what schedule* it kicks in.
+    """
+    if arm == "higher_threshold":
+        # Phase 2 hypothesis (9°F): only run the duty-cycle pattern when the delta
+        # is genuinely large — saves the most runtime on well-mixed days while still
+        # circulating air on the hottest days. 6°F saved nothing (was non-binding on
+        # 5/6 days); 9°F is nearer the p90 and should gate more meaningfully.
+        threshold = EXPERIMENT_HIGH_THRESHOLD_F
+        on_phase  = _duty_cycle_on_phase(now_dt, EXPERIMENT_DUTY_ON_MINUTES, EXPERIMENT_DUTY_OFF_MINUTES)
+        desired   = "ON" if (on_phase and delta > threshold) else "OFF"
+        return desired, threshold, EXPERIMENT_DUTY_ON_MINUTES * 60, \
+            f"higher_threshold: Δ {delta:.1f}°F vs {threshold:.1f}°F, " \
+            f"{'ON' if on_phase else 'OFF'}-phase"
+
+    if arm == "burst":
+        # Hypothesis: most of the mixing happens soon after the morning
+        # ramp-up (per the event-study "elbow"); a finite morning burst may
+        # capture most of the benefit for a fraction of the runtime/wear.
+        threshold = TEMP_DELTA_THRESHOLD_F
+        elapsed = _minutes_since_quiet_hours_end(now_dt)
+        in_window = elapsed is not None and elapsed < EXPERIMENT_BURST_MINUTES
+        desired = "ON" if (in_window and delta > threshold) else "OFF"
+        return desired, threshold, FAN_RUN_DURATION_SECONDS, \
+            (f"burst: {elapsed:.0f}/{EXPERIMENT_BURST_MINUTES}min since quiet hours ended"
+             if elapsed is not None else "burst: in quiet hours")
+
+    if arm == "duty_cycle":
+        # Hypothesis: continuous mixing isn't necessary — short on/off
+        # pulses might sustain most of the benefit at a fraction of the
+        # runtime (less wear, quieter house, same comfort).
+        threshold = TEMP_DELTA_THRESHOLD_F
+        on_phase = _duty_cycle_on_phase(now_dt, EXPERIMENT_DUTY_ON_MINUTES, EXPERIMENT_DUTY_OFF_MINUTES)
+        desired = "ON" if (on_phase and delta > threshold) else "OFF"
+        return desired, threshold, EXPERIMENT_DUTY_ON_MINUTES * 60, \
+            f"duty_cycle: {'ON' if on_phase else 'OFF'}-phase " \
+            f"({EXPERIMENT_DUTY_ON_MINUTES}m on / {EXPERIMENT_DUTY_OFF_MINUTES}m off)"
+
+    # Fallback (includes old "control" and "duty_cycle" arm names from phase 1) —
+    # duty_cycle is now the production default: 15 min on / 15 min off when Δ > threshold.
+    threshold = TEMP_DELTA_THRESHOLD_F
+    on_phase = _duty_cycle_on_phase(now_dt, EXPERIMENT_DUTY_ON_MINUTES, EXPERIMENT_DUTY_OFF_MINUTES)
+    desired = "ON" if (on_phase and delta > threshold) else "OFF"
+    return desired, threshold, EXPERIMENT_DUTY_ON_MINUTES * 60, \
+        f"duty_cycle [default]: {'ON' if on_phase else 'OFF'}-phase " \
+        f"({EXPERIMENT_DUTY_ON_MINUTES}m on / {EXPERIMENT_DUTY_OFF_MINUTES}m off)"
+
+
+def ensure_experiment_logged(d: date, arm: str):
+    """Write today's assigned arm to the DB exactly once (restart-safe)."""
+    key = d.isoformat()
+    if key in _experiment_dates_logged:
+        return
+    _experiment_dates_logged.add(key)
+    log.info("🧪 Experiment arm for %s → %s", key, arm)
+    threading.Thread(target=db_write_experiment_arm, daemon=True,
+                     args=(key, arm, time.time())).start()
 
 
 # ── Fan control loop ──────────────────────────────────────────
@@ -680,7 +1226,8 @@ def evaluate_and_act():
     temp_c   = traits.get("sdm.devices.traits.Temperature", {}).get("ambientTemperatureCelsius")
     humidity = traits.get("sdm.devices.traits.Humidity",    {}).get("ambientHumidityPercent")
     room     = (thermostat.get("parentRelations") or [{}])[0].get("displayName", "thermostat")
-    location = f"nest: {room.lower()}"
+    nest_device_id = f"nest: {room.lower()}"
+    location = resolve_location(nest_device_id)
 
     if temp_c is not None:
         temp_f = round(temp_c * 9 / 5 + 32, 1)
@@ -691,6 +1238,7 @@ def evaluate_and_act():
                 "temp_c":      round(temp_c, 1),
                 "humidity":    humidity,
                 "received_at": ts,
+                "device_id":   nest_device_id,
             }
             if location not in sensor_history:
                 sensor_history[location] = deque(maxlen=HISTORY_MAX)
@@ -700,8 +1248,20 @@ def evaluate_and_act():
                 "humidity": humidity,
             })
         hvac_status = traits.get("sdm.devices.traits.ThermostatHvac", {}).get("status", "OFF")
-        log.info("❶ Nest         %-15s  %.1f°F  %s%% RH  fan=%s  hvac=%s",
-                 location, temp_f, humidity or "?", fan_mode(thermostat), hvac_status)
+
+        # Record what the thermostat is targeting — it moves on a schedule, and
+        # without it "the AC ran more today" can't be separated from
+        # "the target was colder today".
+        sp      = traits.get("sdm.devices.traits.ThermostatTemperatureSetpoint", {})
+        mode    = traits.get("sdm.devices.traits.ThermostatMode", {}).get("mode")
+        eco     = traits.get("sdm.devices.traits.ThermostatEco", {}).get("mode")
+        cool_f  = round(sp["coolCelsius"] * 9 / 5 + 32, 1) if sp.get("coolCelsius") is not None else None
+        heat_f  = round(sp["heatCelsius"] * 9 / 5 + 32, 1) if sp.get("heatCelsius") is not None else None
+        _set_thermostat_snapshot(mode, cool_f, heat_f, hvac_status, eco)
+
+        log.info("❶ Nest         %-15s  %.1f°F  %s%% RH  fan=%s  hvac=%s  mode=%s  set=%s°F",
+                 location, temp_f, humidity or "?", fan_mode(thermostat), hvac_status,
+                 mode, f"{cool_f:.1f}" if cool_f is not None else "?")
         threading.Thread(target=db_write_reading, daemon=True,
                          args=(ts, location, temp_f, round(temp_c, 1), humidity)).start()
 
@@ -741,22 +1301,71 @@ def evaluate_and_act():
     current_mode = fan_mode(thermostat)
     device_name  = thermostat["name"]
 
-    if in_quiet_hours():
+    now_dt = datetime.now()
+    today  = now_dt.date()
+
+    # Quiet hours are an unconditional override — they apply identically no
+    # matter which experiment arm is active today, so this check happens
+    # *before* any arm-aware logic runs (and short-circuits it entirely).
+    if in_quiet_hours(now_dt):
         log.info("Quiet hours (%s–%s) — fan suppressed", FAN_QUIET_START, FAN_QUIET_END)
         if current_mode == "ON":
             log.info("Turning fan OFF for quiet hours")
             set_fan(device_name, "OFF", None, token)
         return
 
-    if delta > TEMP_DELTA_THRESHOLD_F:
-        log.info("Above threshold → fan ON (%d min)", FAN_RUN_DURATION_SECONDS // 60)
-        set_fan(device_name, "ON", FAN_RUN_DURATION_SECONDS, token)
+    # ── Experiment arm: pick today's strategy and act on it ────
+    # "duty_cycle" here means the permanent default, not an active experiment
+    # arm — it's what decide_fan_mode()'s fallback branch actually runs.
+    arm = arm_for_date(today) if EXPERIMENT_ENABLED else "duty_cycle"
+    ensure_experiment_logged(today, arm)
+
+    global _last_logged_arm
+    if arm != _last_logged_arm:
+        log.info("🧪 Today's active experiment arm: %s", arm)
+        _last_logged_arm = arm
+
+    # ── Comfort gate ───────────────────────────────────────────
+    # The arm decides *how* to cycle; this decides whether cycling is worth
+    # anything right now. If the occupied rooms are comfortable, or the
+    # basement has no cold left to give, the blower stays off.
+    comfort = comfort_state(fresh)
+    if comfort["ok"]:
+        log.info("🛋  %s=%.1f°F (cap %.1f)  |  %s=%.1f°F  |  usable %.1f°F  → %s",
+                 comfort["occupied_loc"], comfort["occupied"], COMFORT_MAX_F,
+                 comfort["reservoir_loc"], comfort["reservoir"], comfort["gradient"],
+                 "cool it" if comfort["should_cool"] else "no action needed")
+        if comfort["over_cap"]:
+            log.warning("⚠️  %s is %.1f°F — above the %.1f°F comfort cap",
+                        comfort["occupied_loc"], comfort["occupied"], COMFORT_MAX_F)
+
+        if not comfort["should_cool"]:
+            reason = ("occupied rooms comfortable" if not comfort["too_warm"]
+                      else f"gradient only {comfort['gradient']:.1f}°F "
+                           f"(<{MIN_GRADIENT_F:.1f}) — not worth circulating")
+            if current_mode == "ON":
+                log.info("[%s] comfort gate: %s → fan OFF", arm, reason)
+                set_fan(device_name, "OFF", None, token)
+            else:
+                log.info("[%s] comfort gate: %s → fan already OFF.", arm, reason)
+            return
+    else:
+        # Can't evaluate comfort (e.g. the living-room sensor is down). Fall
+        # through to the delta-based behaviour rather than guessing.
+        log.warning("Comfort gate unavailable (%s) — falling back to delta logic",
+                    comfort["why"])
+
+    desired_mode, threshold_used, run_duration, note = decide_fan_mode(delta, arm, now_dt)
+
+    if desired_mode == "ON":
+        log.info("[%s] %s → fan ON (%d min)", arm, note, run_duration // 60)
+        set_fan(device_name, "ON", run_duration, token)
     else:
         if current_mode == "ON":
-            log.info("Within threshold → fan OFF")
+            log.info("[%s] %s → fan OFF", arm, note)
             set_fan(device_name, "OFF", None, token)
         else:
-            log.info("Within threshold → fan already OFF. Nothing to do.")
+            log.info("[%s] %s → fan already OFF. Nothing to do.", arm, note)
 
 
 # ── Entry point ───────────────────────────────────────────────
@@ -768,11 +1377,28 @@ if __name__ == "__main__":
     log.info("  Threshold    : %.1f°F delta", TEMP_DELTA_THRESHOLD_F)
     log.info("  Fan duration : %d min", FAN_RUN_DURATION_SECONDS // 60)
     log.info("  Stale after  : %ds", SENSOR_STALE_SECONDS)
+    log.info("  Default mode : duty_cycle (%dm on / %dm off)",
+             EXPERIMENT_DUTY_ON_MINUTES, EXPERIMENT_DUTY_OFF_MINUTES)
+    log.info("  Objective    : hold '%s*' under %.1f°F using '%s*' air",
+             OCCUPIED_PREFIX, COMFORT_MAX_F, RESERVOIR_PREFIX)
+    log.info("  Comfort gate : start at %.1f°F, need %.1f°F usable gradient",
+             COMFORT_MAX_F - COMFORT_DEADBAND_F, MIN_GRADIENT_F)
+    log.info("  Quiet hours  : %s",
+             f"{FAN_QUIET_START}–{FAN_QUIET_END}" if quiet_hours_enabled()
+             else "disabled — fan may run overnight")
+    if EXPERIMENT_ENABLED:
+        log.info("  Experiment   : ON — arms %s (vs duty_cycle baseline)", EXPERIMENT_ARMS)
+        log.info("  Today's arm  : %s", arm_for_date(datetime.now().date()))
+        log.info("  High thr.    : %.1f°F", EXPERIMENT_HIGH_THRESHOLD_F)
+    else:
+        log.info("  Experiment   : disabled (always running duty_cycle)")
     log.info("═" * 60)
 
     # Init database and preload history
     db_init()
     db_load_history()
+    db_load_experiment_log()
+    db_load_device_locations()
 
     # Start fan control loop in background thread
     t = threading.Thread(target=fan_control_loop, daemon=True)
