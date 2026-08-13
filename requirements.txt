@@ -1,4 +1,17 @@
+# Hub (hub.py) — required to run the system
 requests>=2.31.0
 python-dotenv>=1.0.0
 flask>=3.0.0
 flask-socketio>=5.3.0
+
+# Offline analysis (analyze.py, comfort_analysis.py, fan_effect.py,
+# experiment_analysis.py). Not needed to run the hub itself.
+pandas>=2.0.0
+numpy>=1.24.0
+matplotlib>=3.7.0
+
+# The Pi sensor node (pi_sensor/sensor.py) additionally needs
+# adafruit-circuitpython-dht and its board/GPIO stack, which only install
+# on a Raspberry Pi — deliberately left out so this file stays
+# installable on a laptop:
+#   pip install adafruit-circuitpython-dht

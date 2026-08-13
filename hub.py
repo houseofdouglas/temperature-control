@@ -66,7 +66,9 @@ RESERVOIR_PREFIX     = os.getenv("RESERVOIR_PREFIX", "basement")
 # when EXPERIMENT_ENABLED=false.  The rotation tests two alternatives against
 # that new baseline: burst (morning-only window) and higher_threshold (runs
 # the duty-cycle pattern only when Δ > EXPERIMENT_HIGH_THRESHOLD_F).
-EXPERIMENT_ENABLED          = os.getenv("EXPERIMENT_ENABLED", "true").lower() == "true"
+# Default off: the phase-1 A/B test concluded (duty_cycle won), so a fresh
+# clone should run the settled strategy rather than start randomising.
+EXPERIMENT_ENABLED          = os.getenv("EXPERIMENT_ENABLED", "false").lower() == "true"
 EXPERIMENT_SEED_SALT        = os.getenv("EXPERIMENT_SEED_SALT", "nest-fan-arms-v2")
 EXPERIMENT_ARMS             = ["burst", "higher_threshold"]
 EXPERIMENT_HIGH_THRESHOLD_F = float(os.getenv("EXPERIMENT_HIGH_THRESHOLD_F", "9.0"))
