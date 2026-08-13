@@ -1,0 +1,33 @@
+#pragma once
+
+// ─────────────────────────────────────────────────────────────
+// Sensor Node Config — copy to config.h and edit per board.
+//
+// config.h is gitignored because it holds WiFi credentials.
+// Never commit it; keep this .example file in sync instead.
+// ─────────────────────────────────────────────────────────────
+
+// WiFi credentials
+#define WIFI_SSID      "your-wifi-ssid"
+#define WIFI_PASSWORD  "your-wifi-password"
+
+// Permanent ID for this board — NOT its room.
+//
+// The hub maps device -> room, so a sensor can be moved between rooms from
+// the dashboard (or POST /api/devices/<id>/location) without reflashing.
+// Whatever you set here is the board's immutable identity; make it unique
+// per board and then leave it alone. A board that has never been renamed
+// simply reports under this name.
+#define LOCATION       "sensor-01"
+
+// Where the hub is listening.
+#define HUB_URL        "http://10.0.0.216:5001/sensor"
+
+// How often to send a reading (milliseconds). 300000 = 5 minutes.
+// Matches the hub's 5-min analysis grid; the DHT11's ±3.6°F noise floor
+// means faster polling mostly samples noise, and the sensor self-heats
+// slightly when read back-to-back.
+#define INTERVAL_MS    300000
+
+// GPIO pin the DHT11 DATA wire is connected to
+#define DHT_PIN        2

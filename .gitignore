@@ -11,3 +11,6 @@ analysis/
 
 # Geocode cache (regenerated on first fetch; holds home coordinates)
 weather_location.json
+
+# Firmware config holds WiFi credentials — copy config.h.example instead
+firmware/sensor_node/config.h
