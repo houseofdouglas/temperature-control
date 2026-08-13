@@ -5,3 +5,9 @@ __pycache__/
 /tmp/
 *.log
 *.db
+
+# Generated analysis output — rebuild with the scripts, don't version it
+analysis/
+
+# Geocode cache (regenerated on first fetch; holds home coordinates)
+weather_location.json
