@@ -60,6 +60,26 @@ MIN_GRADIENT_F       = float(os.getenv("MIN_GRADIENT_F",     "3.0"))
 OCCUPIED_PREFIX      = os.getenv("OCCUPIED_PREFIX",  "upstairs")
 RESERVOIR_PREFIX     = os.getenv("RESERVOIR_PREFIX", "basement")
 
+# Which room actually matters, by time of day.
+#
+# Taking the hottest upstairs room is wrong: at 3am that's often the office,
+# which nobody is in. Optimise for where people actually are — the living room
+# by day, the bedroom overnight.
+#
+# This matters more than it sounds, because the rooms sit on opposite sides of
+# the thermostat. Measured over the current layout, the living room runs
+# ~0.6°F HOTTER than the hallway by day (peaking +2.5°F), while the master
+# bedroom runs ~0.3-1.0°F COOLER. A single target can't serve both.
+#
+# Format:  HH:MM-HH:MM=location[@cap_f]; ...
+# Windows may wrap midnight. @cap overrides COMFORT_MAX_F for that window.
+# Falls back to the hottest OCCUPIED_PREFIX room if the scheduled sensor is
+# stale, so a dead battery degrades rather than blinds the controller.
+OCCUPANCY_SCHEDULE = os.getenv(
+    "OCCUPANCY_SCHEDULE",
+    "07:00-22:00=upstairs: living room; 22:00-07:00=upstairs: master bedroom",
+)
+
 # ── Experiment: rotate daily through fan-control strategies ──
 # Phase 2 (from 2026-06-27): duty_cycle (15 on / 15 off) is now the
 # production default — the fallback for any unrecognized arm and what runs
@@ -401,7 +421,7 @@ def _dashboard_payload() -> dict:
         "delta_f":    delta,
         "threshold_f": TEMP_DELTA_THRESHOLD_F,
         "experiment": {"enabled": EXPERIMENT_ENABLED, "arm": arm},
-        "comfort":    {**comfort, "cap_f": COMFORT_MAX_F},
+        "comfort":    comfort,          # carries its own cap_f for this window
         "thermostat": {
             "mode":        ts_state.get("mode"),
             "cool_f":      ts_state.get("cool_f"),
@@ -1097,44 +1117,92 @@ def _set_thermostat_snapshot(mode, cool_f, heat_f, hvac_status, eco):
                      args=(time.time(), mode, cool_f, heat_f, hvac_status, eco)).start()
 
 
-def comfort_state(fresh: dict) -> dict:
+def _parse_occupancy_schedule(spec: str) -> list:
+    """'07:00-22:00=upstairs: living room@74' -> [(start_min, end_min, loc, cap)]"""
+    windows = []
+    for chunk in spec.split(";"):
+        chunk = chunk.strip()
+        if not chunk:
+            continue
+        try:
+            times, target = chunk.split("=", 1)
+            start_s, end_s = times.split("-", 1)
+            loc, cap = target, None
+            if "@" in target:
+                loc, cap_s = target.rsplit("@", 1)
+                cap = float(cap_s)
+            windows.append((_parse_hhmm(start_s.strip()), _parse_hhmm(end_s.strip()),
+                            loc.strip(), cap))
+        except Exception as e:
+            log.error("Bad OCCUPANCY_SCHEDULE entry %r (%s) — ignoring", chunk, e)
+    return windows
+
+
+_OCCUPANCY_WINDOWS = _parse_occupancy_schedule(OCCUPANCY_SCHEDULE)
+
+
+def occupancy_target(now_dt: datetime):
+    """Which room matters right now, and the cap it must stay under."""
+    mins = now_dt.hour * 60 + now_dt.minute
+    for start, end, loc, cap in _OCCUPANCY_WINDOWS:
+        active = (mins >= start or mins < end) if start > end else (start <= mins < end)
+        if active:
+            return loc, (cap if cap is not None else COMFORT_MAX_F)
+    return None, COMFORT_MAX_F
+
+
+def comfort_state(fresh: dict, now_dt: datetime | None = None) -> dict:
     """Summarise the house against the comfort objective.
 
-    occupied  — hottest occupied upstairs room (what we're trying to hold down)
+    occupied  — the room that matters right now, per OCCUPANCY_SCHEDULE
     reservoir — coldest basement sensor (the free cooling we can draw on)
-    gradient  — how much usable cooling sits below the occupied rooms
+    gradient  — how much usable cooling sits below that room
 
-    Returns why=None when it can't be evaluated (e.g. no upstairs sensor
-    reporting), so callers can fall back rather than act on a guess.
+    Returns ok=False with a reason when it can't be evaluated, so callers can
+    fall back rather than act on a guess.
     """
-    occ = {loc: d["temp_f"] for loc, d in fresh.items()
-           if loc.startswith(OCCUPIED_PREFIX)}
+    now_dt = now_dt or datetime.now()
     res = {loc: d["temp_f"] for loc, d in fresh.items()
            if loc.startswith(RESERVOIR_PREFIX)}
+    occ = {loc: d["temp_f"] for loc, d in fresh.items()
+           if loc.startswith(OCCUPIED_PREFIX)}
 
-    if not occ or not res:
-        missing = "occupied" if not occ else "reservoir"
-        return {"ok": False, "why": f"no {missing} sensor reporting"}
+    if not res:
+        return {"ok": False, "why": "no reservoir sensor reporting"}
+    if not occ:
+        return {"ok": False, "why": "no occupied sensor reporting"}
 
-    occ_loc = max(occ, key=occ.get)
+    target_loc, cap = occupancy_target(now_dt)
+
+    if target_loc and target_loc in occ:
+        occ_loc, basis = target_loc, "scheduled"
+    else:
+        # Scheduled room is stale or unmapped — fall back to the hottest
+        # occupied room so a dead battery degrades rather than blinds us.
+        occ_loc = max(occ, key=occ.get)
+        basis = ("fallback: %s not reporting" % target_loc) if target_loc \
+                else "fallback: no window matches"
+
     res_loc = min(res, key=res.get)
     occupied, reservoir = occ[occ_loc], res[res_loc]
     gradient = occupied - reservoir
 
-    too_warm     = occupied >= COMFORT_MAX_F - COMFORT_DEADBAND_F
+    too_warm     = occupied >= cap - COMFORT_DEADBAND_F
     worth_moving = gradient >= MIN_GRADIENT_F
 
     return {
         "ok":            True,
         "occupied":      occupied,
         "occupied_loc":  occ_loc,
+        "basis":         basis,
+        "cap_f":         cap,
         "reservoir":     reservoir,
         "reservoir_loc": res_loc,
         "gradient":      gradient,
         "too_warm":      too_warm,
         "worth_moving":  worth_moving,
         "should_cool":   too_warm and worth_moving,
-        "over_cap":      occupied > COMFORT_MAX_F,
+        "over_cap":      occupied > cap,
     }
 
 
@@ -1331,18 +1399,19 @@ def evaluate_and_act():
     # The arm decides *how* to cycle; this decides whether cycling is worth
     # anything right now. If the occupied rooms are comfortable, or the
     # basement has no cold left to give, the blower stays off.
-    comfort = comfort_state(fresh)
+    comfort = comfort_state(fresh, now_dt)
     if comfort["ok"]:
-        log.info("🛋  %s=%.1f°F (cap %.1f)  |  %s=%.1f°F  |  usable %.1f°F  → %s",
-                 comfort["occupied_loc"], comfort["occupied"], COMFORT_MAX_F,
+        log.info("🛋  %s=%.1f°F (cap %.1f, %s)  |  %s=%.1f°F  |  usable %.1f°F  → %s",
+                 comfort["occupied_loc"], comfort["occupied"], comfort["cap_f"],
+                 comfort["basis"],
                  comfort["reservoir_loc"], comfort["reservoir"], comfort["gradient"],
                  "cool it" if comfort["should_cool"] else "no action needed")
         if comfort["over_cap"]:
             log.warning("⚠️  %s is %.1f°F — above the %.1f°F comfort cap",
-                        comfort["occupied_loc"], comfort["occupied"], COMFORT_MAX_F)
+                        comfort["occupied_loc"], comfort["occupied"], comfort["cap_f"])
 
         if not comfort["should_cool"]:
-            reason = ("occupied rooms comfortable" if not comfort["too_warm"]
+            reason = (f"{comfort['occupied_loc']} comfortable" if not comfort["too_warm"]
                       else f"gradient only {comfort['gradient']:.1f}°F "
                            f"(<{MIN_GRADIENT_F:.1f}) — not worth circulating")
             if current_mode == "ON":
@@ -1381,8 +1450,12 @@ if __name__ == "__main__":
     log.info("  Stale after  : %ds", SENSOR_STALE_SECONDS)
     log.info("  Default mode : duty_cycle (%dm on / %dm off)",
              EXPERIMENT_DUTY_ON_MINUTES, EXPERIMENT_DUTY_OFF_MINUTES)
-    log.info("  Objective    : hold '%s*' under %.1f°F using '%s*' air",
-             OCCUPIED_PREFIX, COMFORT_MAX_F, RESERVOIR_PREFIX)
+    log.info("  Objective    : hold the occupied room under its cap using '%s*' air",
+             RESERVOIR_PREFIX)
+    for start, end, loc, cap in _OCCUPANCY_WINDOWS:
+        log.info("     %02d:%02d-%02d:%02d  %-28s cap %.1f°F",
+                 start // 60, start % 60, end // 60, end % 60, loc,
+                 cap if cap is not None else COMFORT_MAX_F)
     log.info("  Comfort gate : start at %.1f°F, need %.1f°F usable gradient",
              COMFORT_MAX_F - COMFORT_DEADBAND_F, MIN_GRADIENT_F)
     log.info("  Quiet hours  : %s",
