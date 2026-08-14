@@ -16,7 +16,7 @@ import logging
 import sqlite3
 import threading
 from collections import deque
-from datetime import datetime, date
+from datetime import datetime, date, timedelta
 from flask import Flask, request, jsonify
 from flask_socketio import SocketIO
 import requests as req
@@ -80,6 +80,33 @@ OCCUPANCY_SCHEDULE = os.getenv(
     "07:00-22:00=upstairs: living room@74; 22:00-07:00=upstairs: master bedroom@70",
 )
 
+# ── Thermostat setpoint control ───────────────────────────────
+# The hub normally only touches the fan. With this on it also drives the cool
+# setpoint on a schedule, so the target stops overshooting what comfort needs
+# during the day (measured: the hallway only needs ~72°F to keep the living
+# room under 74°F, but it was being held at 69.8°F).
+#
+# Derived from the measured hallway bias, NOT from the comfort caps directly:
+# the living room runs hotter than the thermostat, the bedroom cooler, so the
+# thermostat target is offset from the room ceiling in opposite directions.
+#
+# Three safeguards, because this changes how the house feels for people who
+# did not ask the computer for an opinion:
+#   1. A MANUAL CHANGE WINS. If the setpoint is ever something we did not
+#      command, that's a human overriding us — back off for the rest of that
+#      window rather than fighting them two minutes later. The override is
+#      logged, which also makes it a clean comfort-failure signal.
+#   2. Hard bounds. Nothing outside [SETPOINT_MIN_F, SETPOINT_MAX_F] is ever
+#      sent, whatever the schedule says.
+#   3. An expiry date. This is a two-week experiment, not a permanent
+#      takeover; past SETPOINT_CONTROL_UNTIL the hub goes back to fan-only.
+SETPOINT_CONTROL_ENABLED = os.getenv("SETPOINT_CONTROL_ENABLED", "false").lower() == "true"
+SETPOINT_SCHEDULE        = os.getenv("SETPOINT_SCHEDULE", "07:00-22:00=72; 22:00-07:00=70")
+SETPOINT_CONTROL_UNTIL   = os.getenv("SETPOINT_CONTROL_UNTIL", "")   # YYYY-MM-DD, blank = no expiry
+SETPOINT_MIN_F           = float(os.getenv("SETPOINT_MIN_F", "68.0"))
+SETPOINT_MAX_F           = float(os.getenv("SETPOINT_MAX_F", "76.0"))
+SETPOINT_TOLERANCE_F     = float(os.getenv("SETPOINT_TOLERANCE_F", "0.6"))  # Nest rounds to 0.5°C steps
+
 # ── Experiment: rotate daily through fan-control strategies ──
 # Phase 2 (from 2026-06-27): duty_cycle (15 on / 15 off) is now the
 # production default — the fallback for any unrecognized arm and what runs
@@ -135,6 +162,11 @@ _last_fan_state: str = "OFF"
 # [{ ts_ms, state: "COOLING"|"HEATING"|"OFF" }, ...]
 hvac_events: deque = deque(maxlen=500)
 _last_hvac_state: str = "OFF"
+
+# ── Setpoint control state ────────────────────────────────────
+_setpoint_commanded: float | None = None   # what we last told the Nest
+_setpoint_yielded_window: str | None = None  # window we've conceded to a human
+_setpoint_last_window: str | None = None     # window we last acted in
 
 # ── Thermostat target ─────────────────────────────────────────
 # The setpoint moves both on a schedule and by hand, so it's a confounder for
@@ -1003,6 +1035,25 @@ def set_fan(device_name: str, mode: str, duration_s: int | None, token: str):
                          args=(event["ts"], mode)).start()
 
 
+def set_cool_setpoint(device_name: str, target_f: float, token: str):
+    """Command the Nest's cool setpoint. Clamped to the safety bounds."""
+    clamped = max(SETPOINT_MIN_F, min(SETPOINT_MAX_F, target_f))
+    if clamped != target_f:
+        log.warning("Setpoint %.1f°F outside [%.1f, %.1f] — clamped to %.1f°F",
+                    target_f, SETPOINT_MIN_F, SETPOINT_MAX_F, clamped)
+    celsius = round((clamped - 32) * 5 / 9, 1)
+    resp = req.post(
+        f"{SDM_BASE}/{device_name}:executeCommand",
+        json={"command": "sdm.devices.commands.ThermostatTemperatureSetpoint.SetCool",
+              "params": {"coolCelsius": celsius}},
+        headers={"Authorization": f"Bearer {token}", "Content-Type": "application/json"},
+        timeout=10,
+    )
+    resp.raise_for_status()
+    log.info("🎯 Setpoint → %.1f°F (%.1f°C)", clamped, celsius)
+    return clamped
+
+
 # ── Quiet hours ───────────────────────────────────────────────
 def _parse_hhmm(s: str):
     h, m = map(int, s.split(":"))
@@ -1149,6 +1200,98 @@ def occupancy_target(now_dt: datetime):
         if active:
             return loc, (cap if cap is not None else COMFORT_MAX_F)
     return None, COMFORT_MAX_F
+
+
+_SETPOINT_WINDOWS = _parse_occupancy_schedule(
+    # Reuse the same parser; the "location" slot carries the target °F.
+    "; ".join(f"{w}" for w in SETPOINT_SCHEDULE.split(";"))
+) if SETPOINT_SCHEDULE.strip() else []
+
+
+def setpoint_target(now_dt: datetime):
+    """(target_f, window_key) for right now, or (None, None) outside any window."""
+    mins = now_dt.hour * 60 + now_dt.minute
+    for start, end, target, _cap in _SETPOINT_WINDOWS:
+        active = (mins >= start or mins < end) if start > end else (start <= mins < end)
+        if active:
+            try:
+                target_f = float(target)
+            except ValueError:
+                log.error("Bad SETPOINT_SCHEDULE target %r — ignoring", target)
+                return None, None
+            # Key the window to a date so a human override expires at the next
+            # transition rather than lasting forever. Overnight windows are
+            # keyed to the day they began.
+            day = now_dt.date()
+            if start > end and mins < end:
+                day = day - timedelta(days=1)
+            return target_f, f"{day.isoformat()}:{start}"
+    return None, None
+
+
+def setpoint_control_active(now_dt: datetime) -> tuple[bool, str]:
+    if not SETPOINT_CONTROL_ENABLED:
+        return False, "disabled"
+    if SETPOINT_CONTROL_UNTIL.strip():
+        try:
+            until = date.fromisoformat(SETPOINT_CONTROL_UNTIL.strip())
+            if now_dt.date() > until:
+                return False, f"expired {until.isoformat()}"
+        except ValueError:
+            log.error("Bad SETPOINT_CONTROL_UNTIL %r — treating as no expiry",
+                      SETPOINT_CONTROL_UNTIL)
+    return True, "active"
+
+
+def manage_setpoint(device_name: str, current_f: float | None,
+                    mode: str | None, now_dt: datetime, token: str):
+    """Drive the cool setpoint on a schedule, yielding to any human change."""
+    global _setpoint_commanded, _setpoint_yielded_window
+
+    active, why = setpoint_control_active(now_dt)
+    if not active:
+        return
+    if mode != "COOL":
+        log.info("Setpoint control idle — thermostat mode is %s, not COOL", mode)
+        return
+    if current_f is None:
+        return
+
+    target_f, window = setpoint_target(now_dt)
+    if target_f is None:
+        return
+
+    # New window (or first run): a previous window's override doesn't carry
+    # over, so forget what we commanded and re-assert the schedule.
+    global _setpoint_last_window
+    if window != _setpoint_last_window:
+        if _setpoint_yielded_window is not None:
+            log.info("New setpoint window — resuming schedule control")
+        _setpoint_last_window   = window
+        _setpoint_commanded     = None
+        _setpoint_yielded_window = None
+
+    if _setpoint_yielded_window == window:
+        return   # conceded to a human for the rest of this window
+
+    # A human moved it: it's neither what we last commanded nor the target.
+    if _setpoint_commanded is not None \
+            and abs(current_f - _setpoint_commanded) > SETPOINT_TOLERANCE_F \
+            and abs(current_f - target_f) > SETPOINT_TOLERANCE_F:
+        _setpoint_yielded_window = window
+        log.warning("🙋 Setpoint changed by hand to %.1f°F (we had set %.1f°F) — "
+                    "yielding until the next window", current_f, _setpoint_commanded)
+        return
+
+    if abs(current_f - target_f) <= SETPOINT_TOLERANCE_F:
+        _setpoint_commanded = current_f    # already where we want it
+        return
+
+    try:
+        _setpoint_commanded = set_cool_setpoint(device_name, target_f, token)
+        log.info("   (scheduled target for this window: %.1f°F)", target_f)
+    except Exception as e:
+        log.error("Setpoint command failed: %s", e)
 
 
 def comfort_state(fresh: dict, now_dt: datetime | None = None) -> dict:
@@ -1335,6 +1478,9 @@ def evaluate_and_act():
         threading.Thread(target=db_write_reading, daemon=True,
                          args=(ts, location, temp_f, round(temp_c, 1), humidity)).start()
 
+        # Drive the target on a schedule (no-op unless explicitly enabled).
+        manage_setpoint(thermostat["name"], cool_f, mode, datetime.now(), token)
+
         global _last_hvac_state
         if hvac_status != _last_hvac_state:
             _last_hvac_state = hvac_status
@@ -1461,6 +1607,17 @@ if __name__ == "__main__":
     log.info("  Quiet hours  : %s",
              f"{FAN_QUIET_START}–{FAN_QUIET_END}" if quiet_hours_enabled()
              else "disabled — fan may run overnight")
+    _sp_active, _sp_why = setpoint_control_active(datetime.now())
+    if _sp_active:
+        log.info("  Setpoint ctrl: ON — hub drives the target (bounds %.1f–%.1f°F)",
+                 SETPOINT_MIN_F, SETPOINT_MAX_F)
+        for start, end, target, _ in _SETPOINT_WINDOWS:
+            log.info("     %02d:%02d-%02d:%02d  target %s°F",
+                     start // 60, start % 60, end // 60, end % 60, target)
+        log.info("     manual changes win until the next window; expires %s",
+                 SETPOINT_CONTROL_UNTIL or "never")
+    else:
+        log.info("  Setpoint ctrl: off (%s) — thermostat left alone", _sp_why)
     if EXPERIMENT_ENABLED:
         log.info("  Experiment   : ON — arms %s (vs duty_cycle baseline)", EXPERIMENT_ARMS)
         log.info("  Today's arm  : %s", arm_for_date(datetime.now().date()))
