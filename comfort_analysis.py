@@ -12,13 +12,19 @@ So the metrics invert. Delta is no longer the outcome — it's a *resource*
 (how much cold air is available to move). The outcome is compressor runtime,
 and comfort becomes a constraint rather than the thing being optimised:
 
-  primary    ac_hours          compressor hours/day        ↓ lower is better
-  guardrail  over_cap_hours    occupied room > cap          must stay ~0
-  guardrail  worst_excursion   hottest occupied reading     must stay ~cap
-  guardrail  setpoint_drops    manual thermostat overrides  must stay ~0
+  primary    ac_hours          compressor hours/day         ↓ lower is better
+  guardrail  over_cap_hours    occupied room over its cap    must stay ~0
+  guardrail  worst_over_cap    worst °F above the cap        must stay ≤0
+  guardrail  setpoint_drops    manual thermostat overrides   must stay ~0
   cost       fan_hours         blower hours/day
   covariate  outdoor_high      weather
   covariate  setpoint_mean     what the thermostat targeted
+
+"Occupied room" and "cap" both vary by time of day (OCCUPANCY_SCHEDULE):
+the living room against 74°F while people are up, the master bedroom against
+70°F overnight. That mirrors the controller — grading every hour against one
+room and one ceiling would flag a hot empty office at 3am as a failure while
+missing real bedroom excursions.
 
 Two measurement traps this script exists to avoid:
 
@@ -65,17 +71,59 @@ RESAMPLE = "5min"
 # compared against — see the module docstring.
 REGIME_START = pd.Timestamp("2026-08-12")
 
-COMFORT_CAP_F   = float(os.getenv("COMFORT_MAX_F", "74.0"))
+COMFORT_CAP_F   = float(os.getenv("COMFORT_MAX_F", "74.0"))   # fallback when no window matches
 MIN_GRADIENT_F  = float(os.getenv("MIN_GRADIENT_F", "3.0"))
 OCCUPIED_PREFIX = os.getenv("OCCUPIED_PREFIX",  "upstairs")
 RESERVOIR_PREFIX = os.getenv("RESERVOIR_PREFIX", "basement")
 THERMOSTAT_PREFIX = "nest"
-LIVING_ROOM     = "upstairs: living room"   # the comfort reference room
+LIVING_ROOM     = "upstairs: living room"   # reference room for the hallway-bias check
+
+# Must mirror hub.py's OCCUPANCY_SCHEDULE, or the analysis grades the
+# controller against a target it was never trying to hit — reporting a hot
+# empty office at 3am as a comfort failure while missing real bedroom
+# excursions overnight.
+OCCUPANCY_SCHEDULE = os.getenv(
+    "OCCUPANCY_SCHEDULE",
+    "07:00-22:00=upstairs: living room@74; 22:00-07:00=upstairs: master bedroom@70",
+)
 
 C_AC   = "#e34948"
 C_FAN  = "#2a78d6"
 C_GRAD = "#1baf7a"
 C_WARN = "#eb6834"
+
+
+def _parse_occupancy(spec: str) -> list:
+    out = []
+    for chunk in spec.split(";"):
+        chunk = chunk.strip()
+        if not chunk:
+            continue
+        times, target = chunk.split("=", 1)
+        start_s, end_s = times.split("-", 1)
+        loc, cap = target, COMFORT_CAP_F
+        if "@" in target:
+            loc, cap_s = target.rsplit("@", 1)
+            cap = float(cap_s)
+        to_min = lambda t: int(t.split(":")[0]) * 60 + int(t.split(":")[1])
+        out.append((to_min(start_s.strip()), to_min(end_s.strip()), loc.strip(), cap))
+    return out
+
+
+OCCUPANCY_WINDOWS = _parse_occupancy(OCCUPANCY_SCHEDULE)
+
+
+def _occupancy_frames(index: pd.DatetimeIndex):
+    """Per-timestamp (target room, cap) from the schedule."""
+    mins = index.hour * 60 + index.minute
+    room = pd.Series(None, index=index, dtype=object)
+    cap  = pd.Series(COMFORT_CAP_F, index=index, dtype=float)
+    for start, end, loc, c in OCCUPANCY_WINDOWS:
+        active = ((mins >= start) | (mins < end)) if start > end else \
+                 ((mins >= start) & (mins < end))
+        room[active] = loc
+        cap[active]  = c
+    return room, cap
 
 
 # ── Loading ──────────────────────────────────────────────────────
@@ -96,9 +144,20 @@ def load_frame(conn, since_ts):
     res_cols = [c for c in wide.columns if c.startswith(RESERVOIR_PREFIX)]
     th_cols  = [c for c in wide.columns if c.startswith(THERMOSTAT_PREFIX)]
 
-    # The hottest occupied room is what comfort is judged on — an average would
-    # hide the one room that's actually uncomfortable.
-    wide["occupied"]  = wide[occ_cols].max(axis=1) if occ_cols else np.nan
+    # Comfort is judged on the room the schedule says is occupied right now,
+    # matching what the controller actually optimises. Where that sensor is
+    # missing, fall back to the hottest occupied room — the same degradation
+    # the hub applies — so a gap doesn't silently drop the row.
+    room, cap = _occupancy_frames(wide.index)
+    hottest = wide[occ_cols].max(axis=1) if occ_cols else pd.Series(np.nan, index=wide.index)
+    scheduled = pd.Series(np.nan, index=wide.index, dtype=float)
+    for loc in set(r for r in room.dropna().unique() if r in wide.columns):
+        m = (room == loc)
+        scheduled[m] = wide.loc[m, loc]
+    wide["occupied"]     = scheduled.fillna(hottest)
+    wide["occupied_room"] = room
+    wide["cap_f"]        = cap
+    wide["hottest_occ"]  = hottest
     wide["reservoir"] = wide[res_cols].min(axis=1) if res_cols else np.nan
     wide["hallway"]   = wide[th_cols].mean(axis=1) if th_cols else np.nan
     wide["living_room"] = wide[LIVING_ROOM] if LIVING_ROOM in wide.columns else np.nan
@@ -179,13 +238,20 @@ def daily_summary(df: pd.DataFrame, drops: pd.DataFrame) -> pd.DataFrame:
     step_h = pd.Timedelta(RESAMPLE).total_seconds() / 3600
     g = df.groupby(df.index.date)
 
+    # Compare each sample to the cap in force at that moment, not one global
+    # number — the night ceiling is lower than the daytime one.
+    over = (df["occupied"] > df["cap_f"])
+    # How far above its own cap the room got; comparable across windows.
+    excess = (df["occupied"] - df["cap_f"])
+
     out = pd.DataFrame({
         "ac_hours":        g["ac_on"].sum() * step_h,
         "fan_hours":       g["fan_on"].sum() * step_h,
         "coverage_h":      g["occupied"].count() * step_h,
         "occupied_mean":   g["occupied"].mean(),
         "worst_excursion": g["occupied"].max(),
-        "over_cap_hours":  g["occupied"].apply(lambda s: (s > COMFORT_CAP_F).sum()) * step_h,
+        "worst_over_cap":  excess.groupby(df.index.date).max(),
+        "over_cap_hours":  over.groupby(df.index.date).sum() * step_h,
         "reservoir_mean":  g["reservoir"].mean(),
         "gradient_mean":   g["gradient"].mean(),
         "usable_hours":    g["gradient"].apply(lambda s: (s >= MIN_GRADIENT_F).sum()) * step_h,
@@ -245,10 +311,25 @@ def print_report(daily: pd.DataFrame, df: pd.DataFrame, drops: pd.DataFrame):
         print(f"    AC compressor      {full['ac_hours'].mean():5.2f} h/day   ← primary metric")
         print(f"    Fan blower         {full['fan_hours'].mean():5.2f} h/day")
         print(f"    Occupied mean      {full['occupied_mean'].mean():5.1f} °F")
-        print(f"    Worst excursion    {full['worst_excursion'].max():5.1f} °F "
-              f"(cap {COMFORT_CAP_F:.1f})")
+        print(f"    Worst over cap     {full['worst_over_cap'].max():+5.1f} °F "
+              f"(above the cap in force at the time)")
         print(f"    Hours over cap     {full['over_cap_hours'].mean():5.2f} h/day")
         print(f"    Setpoint drops     {full['setpoint_drops'].mean():5.2f} /day")
+
+    # Per-window breakdown — day and night are different rooms and ceilings,
+    # so a single average hides which period is actually failing.
+    print("\n  By occupancy window:")
+    for start, end, loc, cap in OCCUPANCY_WINDOWS:
+        m = (df["occupied_room"] == loc)
+        sub = df[m]
+        if sub.empty:
+            continue
+        over_h = (sub["occupied"] > sub["cap_f"]).sum() * (
+            pd.Timedelta(RESAMPLE).total_seconds() / 3600)
+        print(f"    {start//60:02d}:{start%60:02d}-{end//60:02d}:{end%60:02d} "
+              f"{loc:<26} cap {cap:.1f}°F   "
+              f"mean {sub['occupied'].mean():.1f}°F  peak {sub['occupied'].max():.1f}°F  "
+              f"over-cap {over_h:.1f}h  AC {sub['ac_on'].mean()*100:.0f}%")
 
     # The reservoir is the whole premise — say plainly whether it's there.
     print(f"\n  Reservoir availability:")
@@ -310,7 +391,9 @@ def plot_daily(daily: pd.DataFrame, path: str):
     ax = axes[1]
     ax.plot(x, cur["worst_excursion"], "o-", color=C_WARN, lw=2, label="Worst occupied reading")
     ax.plot(x, cur["occupied_mean"], "o--", color=C_WARN, lw=1, alpha=.5, label="Occupied mean")
-    ax.axhline(COMFORT_CAP_F, color="#898781", ls=":", lw=2, label=f"{COMFORT_CAP_F:.0f}°F cap")
+    # Caps differ per window, so draw each distinct one.
+    for c in sorted({w[3] for w in OCCUPANCY_WINDOWS} or {COMFORT_CAP_F}):
+        ax.axhline(c, color="#898781", ls=":", lw=2, label=f"{c:.0f}°F cap")
     for d, r in cur.iterrows():
         if r["setpoint_drops"]:
             ax.annotate("↓", (d, r["worst_excursion"]), color=C_AC,
@@ -370,7 +453,9 @@ def plot_hall_bias(df: pd.DataFrame, path: str, window_label: str = ""):
     fig, ax = plt.subplots(figsize=(11, 4))
     ax.plot(sub.index, sub["living_room"], color=C_WARN, lw=1.5, label="Living room")
     ax.plot(sub.index, sub["hallway"], color=C_FAN, lw=1.5, ls="--", label="Hallway (Nest)")
-    ax.axhline(COMFORT_CAP_F, color="#898781", ls=":", lw=2, label=f"{COMFORT_CAP_F:.0f}°F cap")
+    # Caps differ per window, so draw each distinct one.
+    for c in sorted({w[3] for w in OCCUPANCY_WINDOWS} or {COMFORT_CAP_F}):
+        ax.axhline(c, color="#898781", ls=":", lw=2, label=f"{c:.0f}°F cap")
     ax.fill_between(sub.index, sub["hallway"], sub["living_room"],
                     where=sub["living_room"] > sub["hallway"],
                     color=C_WARN, alpha=.15, label="Living room hotter")
