@@ -77,7 +77,7 @@ RESERVOIR_PREFIX     = os.getenv("RESERVOIR_PREFIX", "basement")
 # stale, so a dead battery degrades rather than blinds the controller.
 OCCUPANCY_SCHEDULE = os.getenv(
     "OCCUPANCY_SCHEDULE",
-    "07:00-22:00=upstairs: living room; 22:00-07:00=upstairs: master bedroom",
+    "07:00-22:00=upstairs: living room@74; 22:00-07:00=upstairs: master bedroom@70",
 )
 
 # ── Experiment: rotate daily through fan-control strategies ──
@@ -1456,8 +1456,8 @@ if __name__ == "__main__":
         log.info("     %02d:%02d-%02d:%02d  %-28s cap %.1f°F",
                  start // 60, start % 60, end // 60, end % 60, loc,
                  cap if cap is not None else COMFORT_MAX_F)
-    log.info("  Comfort gate : start at %.1f°F, need %.1f°F usable gradient",
-             COMFORT_MAX_F - COMFORT_DEADBAND_F, MIN_GRADIENT_F)
+    log.info("  Comfort gate : start %.1f°F below the window's cap, "
+             "need %.1f°F usable gradient", COMFORT_DEADBAND_F, MIN_GRADIENT_F)
     log.info("  Quiet hours  : %s",
              f"{FAN_QUIET_START}–{FAN_QUIET_END}" if quiet_hours_enabled()
              else "disabled — fan may run overnight")
