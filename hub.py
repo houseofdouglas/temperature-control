@@ -77,7 +77,7 @@ RESERVOIR_PREFIX     = os.getenv("RESERVOIR_PREFIX", "basement")
 # stale, so a dead battery degrades rather than blinds the controller.
 OCCUPANCY_SCHEDULE = os.getenv(
     "OCCUPANCY_SCHEDULE",
-    "07:00-22:00=upstairs: living room@74; 22:00-07:00=upstairs: master bedroom@70",
+    "07:00-20:00=upstairs: living room@74; 20:00-07:00=upstairs: master bedroom@70",
 )
 
 # ── Thermostat setpoint control ───────────────────────────────
@@ -101,7 +101,7 @@ OCCUPANCY_SCHEDULE = os.getenv(
 #   3. An expiry date. This is a two-week experiment, not a permanent
 #      takeover; past SETPOINT_CONTROL_UNTIL the hub goes back to fan-only.
 SETPOINT_CONTROL_ENABLED = os.getenv("SETPOINT_CONTROL_ENABLED", "false").lower() == "true"
-SETPOINT_SCHEDULE        = os.getenv("SETPOINT_SCHEDULE", "07:00-22:00=73; 22:00-07:00=70")
+SETPOINT_SCHEDULE        = os.getenv("SETPOINT_SCHEDULE", "07:00-20:00=73; 20:00-07:00=70")
 SETPOINT_CONTROL_UNTIL   = os.getenv("SETPOINT_CONTROL_UNTIL", "")   # YYYY-MM-DD, blank = no expiry
 SETPOINT_MIN_F           = float(os.getenv("SETPOINT_MIN_F", "68.0"))
 SETPOINT_MAX_F           = float(os.getenv("SETPOINT_MAX_F", "76.0"))
